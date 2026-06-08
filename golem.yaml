@@ -18,7 +18,7 @@ environments:
     server: cloud
     componentPresets: release
 components:
-  golem-web-crawler-rust:rust-main:
+  golem-rust:web-crawler:
     dir: ""
     templates: rust
 httpApi:

@@ -15,7 +15,7 @@ graph TD
     User["User / API Client"] -->|1. Start Crawl| Orchestrator["OrchestratorAgent (Durable)"]
     Orchestrator -->|2. Register/Route URL| DomainAgent["DomainCrawlerAgent (Durable)"]
     DomainAgent -->|3. Fetch & Parse| Fetcher["FetcherAgent (Ephemeral / Worker)"]
-    Fetcher -->|4. Outgoing HTTP Request via wstd| Web["External Website"]
+    Fetcher -->|4. Outgoing HTTP Request via golem-wasi-http| Web["External Website"]
     Fetcher -->|5. Store Content & Mark Processed via Golem Postgres| DB[(PostgreSQL)]
     Fetcher -->|6. Return Extracted Links| DomainAgent
     DomainAgent -->|7. Query DB for Unvisited Links| DB
@@ -26,10 +26,9 @@ graph TD
 
 ## Technical Stack Selection
 
-### 1. HTTP Client: `wstd::http`
-*   **Implementation**: Utilizes `wstd::http::Client` which compiles to `wasm32-wasip2` and utilizes WASI-HTTP directly.
-*   **Alternative**: `golem-wasi-http` for reqwest-like builder APIs if complex multipart/form capabilities are needed.
-*   **Benefits**: Built-in support, no native OS dependencies, works perfectly with Golem's durable retry policies.
+### 1. HTTP Client: `golem-wasi-http`
+*   **Implementation**: Uses the `golem-wasi-http` client library (with `async` and `json` features enabled).
+*   **Benefits**: Reqwest-like builder APIs (`.get()`, `.post()`, `.bearer_auth()`, `.query()`, `.error_for_status()`) targeting WASI-HTTP. It integrates natively with Golem's durable retry policies.
 
 ### 2. Database Integration: Golem RDBMS (`PostgreSQL`)
 *   **Library**: `golem_rust::bindings::golem::rdbms::postgres` (built-in Golem Host API).
@@ -88,15 +87,17 @@ CREATE TABLE page_contents (
 
 ---
 
-## Agent-Specific Error Models
+## Modular Component and Agent Design
 
-By creating separate, scoped error schemas, each agent exposes a minimal API and keeps its error domains clean.
+Each agent is placed in its own dedicated Rust module along with its related schemas and error types. Shared data models (such as `PrioritizedUrl`) are maintained in a shared/common scope.
+
+### 1. `src/orchestrator.rs`
+Contains `OrchestratorAgent`, its status models, and errors.
 
 ```rust
-use golem_rust::Schema;
+use golem_rust::{agent_definition, endpoint, Schema};
 use serde::{Deserialize, Serialize};
 
-// Orchestrator-specific errors
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum OrchestratorError {
     EmptySeedList,
@@ -104,37 +105,6 @@ pub enum OrchestratorError {
     InvalidDomainRegistered { domain: String },
     OrchestratorDBFailure { message: String },
 }
-
-// DomainCrawler-specific errors
-#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
-pub enum DomainCrawlerError {
-    QueueFull { max_size: usize },
-    InvalidUrlForDomain { url: String, domain: String },
-    ConfigurationError { message: String },
-}
-
-// Fetcher-specific errors
-#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
-pub enum FetcherError {
-    InvalidUrl { url: String, reason: String },
-    RobotsDisallowed { url: String },
-    HttpFetchFailed { url: String, status_code: u16, message: String },
-    PostgresWriteFailed { message: String },
-}
-```
-
----
-
-## Agent Designs & REST API Endpoints
-
-Using Golem HTTP annotations (`#[agent_definition]`, `#[endpoint]`), we expose control loops over HTTP using the agent-specific error types.
-
-### 1. `OrchestratorAgent` (Durable)
-Exposed at `/crawlers/{crawl_job_id}`.
-
-```rust
-use golem_rust::{agent_definition, endpoint, Schema};
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct CrawlStatus {
@@ -145,14 +115,14 @@ pub struct CrawlStatus {
 
 #[agent_definition(mount = "/crawlers/{crawl_job_id}")]
 pub trait OrchestratorAgent {
-    // The constructor defines the agent identity based on crawl_job_id
+    // Constructor parameter identifies the Orchestrator agent instance
     fn new(crawl_job_id: String) -> Self;
 
-    // Start a crawl session.
+    // Start a crawl session
     #[endpoint(post = "/start")]
     async fn start_crawl(&mut self, seeds: Vec<String>) -> Result<(), OrchestratorError>;
 
-    // Get current crawl session statistics.
+    // Get current crawl session statistics
     #[endpoint(get = "/status")]
     async fn get_status(&self) -> Result<CrawlStatus, OrchestratorError>;
 
@@ -161,10 +131,14 @@ pub trait OrchestratorAgent {
 }
 ```
 
-### 2. `DomainCrawlerAgent` (Durable)
-Exposed at `/domains/{domain_name}`.
+### 2. `src/domain_crawler.rs`
+Contains `DomainCrawlerAgent`, its configuration state, and errors.
 
 ```rust
+use golem_rust::{agent_definition, endpoint, Schema};
+use serde::{Deserialize, Serialize};
+
+// Shared model for referencing a URL and its queue priority
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct PrioritizedUrl {
     pub url: String,
@@ -172,15 +146,23 @@ pub struct PrioritizedUrl {
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum DomainCrawlerError {
+    QueueFull { max_size: usize },
+    InvalidUrlForDomain { url: String, domain: String },
+    ConfigurationError { message: String },
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
-    pub pending_queue: Vec<PrioritizedUrl>, // Sorted by priority DESC, discovered_at ASC
+    pub pending_queue: Vec<PrioritizedUrl>, // Sorted by priority DESC
     pub in_progress_count: u32,
 }
 
 #[agent_definition(mount = "/domains/{domain_name}")]
 pub trait DomainCrawlerAgent {
+    // Constructor parameter identifies the Domain Crawler agent instance
     fn new(domain_name: String) -> Self;
 
     // Enqueue new unvisited URLs found under this domain
@@ -196,10 +178,22 @@ pub trait DomainCrawlerAgent {
 }
 ```
 
-### 3. `FetcherAgent` (Ephemeral / Stateless Worker)
-Not exposed over HTTP. It acts as an internal worker agent invoked via RPC by `DomainCrawlerAgent`.
+### 3. `src/fetcher.rs`
+Contains the stateless `FetcherAgent` worker using `golem-wasi-http` for outgoing HTTP requests.
 
 ```rust
+use golem_rust::{agent_definition, Schema};
+use serde::{Deserialize, Serialize};
+use crate::domain_crawler::PrioritizedUrl;
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum FetcherError {
+    InvalidUrl { url: String, reason: String },
+    RobotsDisallowed { url: String },
+    HttpFetchFailed { url: String, status_code: u16, message: String },
+    PostgresWriteFailed { message: String },
+}
+
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct FetchResult {
     pub url: String,
@@ -210,9 +204,10 @@ pub struct FetchResult {
 
 #[agent_definition(ephemeral)]
 pub trait FetcherAgent {
+    // Constructor parameter identifies the fetcher worker instance
     fn new(worker_id: String) -> Self;
 
-    // Fetch the page using wstd::http and persist results to PostgreSQL
+    // Fetch the page using golem-wasi-http and persist results to PostgreSQL
     async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError>;
 }
 ```
@@ -225,8 +220,9 @@ To ensure memory remains bounded even when crawling millions of pages:
 
 1. **Start**: `DomainCrawlerAgent` pops the next URL from `pending_queue` and increments `in_progress_count`.
 2. **Execute**: It invokes the `FetcherAgent` with the URL.
-3. **Fetch (`wstd::http`)**: `FetcherAgent` fetches the page content using WASI HTTP.
+3. **Fetch (`golem-wasi-http`)**: `FetcherAgent` fetches the page content using `golem-wasi-http::Client`.
 4. **Persist (Postgres)**: `FetcherAgent` inserts the content to PostgreSQL, marks the URL as **Processed** in the database, and returns all extracted hyperlinks (with assigned priorities).
 5. **Clean up**: `DomainCrawlerAgent` receives the links and decrements `in_progress_count`.
 6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
 7. **Queue**: The remaining new prioritized URLs are merged into the `pending_queue` sorted by priority DESC (up to its maximum capacity limit).
+

@@ -356,9 +356,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "golem_web_crawler_rust"
+name = "golem_rust_web_crawler"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "golem-ai-embed",
  "golem-ai-embed-openai",
  "golem-rust",
