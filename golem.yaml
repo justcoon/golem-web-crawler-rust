@@ -1,0 +1,29 @@
+# Schema for IDEA:
+# $schema: https://schema.golem.cloud/app/golem/1.5.0/golem.schema.json
+# Schema for vscode-yaml:
+# yaml-language-server: $schema=https://schema.golem.cloud/app/golem/1.5.0/golem.schema.json
+
+# Field reference: https://learn.golem.cloud/app-manifest#field-reference
+# Creating HTTP APIs: https://learn.golem.cloud/invoke/making-custom-apis
+
+manifestVersion: 1.5.0
+
+app: golem-web-crawler-rust
+
+environments:
+  local:
+    server: local
+    componentPresets: debug
+  cloud:
+    server: cloud
+    componentPresets: release
+components:
+  golem-web-crawler-rust:rust-main:
+    dir: ""
+    templates: rust
+httpApi:
+  deployments:
+    local:
+    - domain: golem-web-crawler-rust.localhost:9006
+      agents:
+        CounterAgent: {}
