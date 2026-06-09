@@ -1,5 +1,12 @@
-use golem_rust::{Schema, agent_definition, endpoint};
+use crate::common_lib::database::PostgresDbConfig;
+use golem_rust::{ConfigSchema, Schema, agent_definition, agentic::Config, endpoint};
 use serde::{Deserialize, Serialize};
+
+#[derive(ConfigSchema)]
+pub struct OrchestratorConfig {
+    #[config_schema(nested)]
+    pub db: PostgresDbConfig,
+}
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct CrawlStatus {
@@ -18,7 +25,7 @@ pub enum OrchestratorError {
 
 #[agent_definition(mount = "/crawlers/{crawl_job_id}")]
 pub trait OrchestratorAgent {
-    fn new(crawl_job_id: String) -> Self;
+    fn new(crawl_job_id: String, #[agent_config] config: Config<OrchestratorConfig>) -> Self;
 
     #[endpoint(post = "/start")]
     async fn start_crawl(&mut self, seeds: Vec<String>) -> Result<(), OrchestratorError>;

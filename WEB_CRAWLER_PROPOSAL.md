@@ -91,7 +91,91 @@ CREATE TABLE page_contents (
 
 Each agent is placed in its own dedicated Rust module along with its related schemas and error types. Shared data models (such as `PrioritizedUrl`) are maintained in a shared/common scope.
 
-### 1. `src/orchestrator.rs`
+### Configuration for Database Access
+
+To make each database‑accessing agent configurable we introduce a typed configuration struct that includes a `db: PostgresDbConfig` field. The structs derive `ConfigSchema` so they are automatically exposed in the Golem manifest.
+
+```rust
+// src/orchestrator.rs
+#[derive(ConfigSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    // Database connection details used by the orchestrator
+    pub db: PostgresDbConfig,
+    // (optional) future fields such as concurrency limits can be added here
+}
+
+// src/fetcher.rs
+#[derive(ConfigSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct FetcherConfig {
+    pub db: PostgresDbConfig,
+}
+
+// src/domain_crawler.rs
+use crate::common::PrioritizedUrl;
+use crate::common_lib::database::PostgresDbConfig;
+use golem_rust::{ConfigSchema, Schema, agent_definition, agentic::Config, endpoint};
+use serde::{Deserialize, Serialize};
+
+#[derive(ConfigSchema)]
+pub struct DomainCrawlerConfig {
+    #[config_schema(nested)]
+    pub db: PostgresDbConfig,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct DomainState {
+    pub domain: String,
+    pub politeness_delay_ms: u32,
+    // Queue of pending URLs sorted by priority DESC
+    pub pending_queue: Vec<PrioritizedUrl>,
+    pub in_progress_count: u32,
+}
+```
+
+### How the config is passed to agents
+
+Each agent’s constructor now takes a `#[agent_config] Config<…>` parameter:
+
+```rust
+// Example for OrchestratorAgent
+fn new(crawl_job_id: String, #[agent_config] config: Config<OrchestratorConfig>) -> Self;
+```
+
+The implementation stores the `Config` value inside the agent struct and uses it when creating a `DatabaseHelper`:
+
+```rust
+let db_cfg = self.config.get().db;
+let db = DatabaseHelper::from(db_cfg)?;
+```
+
+### Manifest updates (`golem.yaml`)
+
+Add the configuration under each agent’s `config` section:
+
+```yaml
+agents:
+  OrchestratorAgent:
+    config:
+      db:
+        host: "{{ POSTGRES_HOST }}"
+        db: "{{ POSTGRES_DB }}"
+        port: "{{ POSTGRES_PORT }}"
+  FetcherAgent:
+    config:
+      db: *same-as-above
+  DomainCrawlerAgent:
+    config:
+      db: *same-as-above
+secretDefaults:
+  local:
+    db:
+      user: "{{ POSTGRES_USER }}"
+      password: "{{ POSTGRES_PASSWORD }}"
+```
+
+These changes enable each agent to obtain its own database credentials and simplify testing and deployment across environments.
+
+---
 Contains `OrchestratorAgent`, its status models, and errors.
 
 ```rust
@@ -116,7 +200,7 @@ pub struct CrawlStatus {
 #[agent_definition(mount = "/crawlers/{crawl_job_id}")]
 pub trait OrchestratorAgent {
     // Constructor parameter identifies the Orchestrator agent instance
-    fn new(crawl_job_id: String) -> Self;
+    fn new(crawl_job_id: String, #[agent_config] config: Config<OrchestratorConfig>) -> Self;
 
     // Start a crawl session
     #[endpoint(post = "/start")]
@@ -163,7 +247,7 @@ pub struct DomainState {
 #[agent_definition(mount = "/domains/{domain_name}")]
 pub trait DomainCrawlerAgent {
     // Constructor parameter identifies the Domain Crawler agent instance
-    fn new(domain_name: String) -> Self;
+    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
 
     // Enqueue new unvisited URLs found under this domain
     async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError>;
@@ -205,7 +289,7 @@ pub struct FetchResult {
 #[agent_definition(ephemeral)]
 pub trait FetcherAgent {
     // Constructor parameter identifies the fetcher worker instance
-    fn new(worker_id: String) -> Self;
+    fn new(#[agent_config] config: Config<FetcherConfig>) -> Self;
 
     // Fetch the page using golem-wasi-http and persist results to PostgreSQL
     async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError>;

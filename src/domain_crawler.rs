@@ -1,7 +1,14 @@
 // src/domain_crawler.rs
 use crate::common::PrioritizedUrl;
-use golem_rust::{Schema, agent_definition, endpoint};
+use crate::common_lib::database::PostgresDbConfig;
+use golem_rust::{ConfigSchema, Schema, agent_definition, agentic::Config, endpoint};
 use serde::{Deserialize, Serialize};
+
+#[derive(ConfigSchema)]
+pub struct DomainCrawlerConfig {
+    #[config_schema(nested)]
+    pub db: PostgresDbConfig,
+}
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainState {
@@ -22,7 +29,7 @@ pub enum DomainCrawlerError {
 #[agent_definition(mount = "/domains/{domain_name}")]
 pub trait DomainCrawlerAgent {
     // Constructor identifies the domain crawler instance.
-    fn new(domain_name: String) -> Self;
+    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
 
     // Enqueue new URLs discovered under this domain.
     async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError>;

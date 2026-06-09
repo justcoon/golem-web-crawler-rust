@@ -21,6 +21,16 @@ components:
   golem-rust:web-crawler:
     dir: ""
     templates: rust
+    config:
+      db:
+        host: "{{ POSTGRES_HOST }}"
+        db: "{{ POSTGRES_DB }}"
+        port: "{{ POSTGRES_PORT }}"
+secretDefaults:
+  local:
+    db:
+      user: "{{ POSTGRES_USER }}"
+      password: "{{ POSTGRES_PASSWORD }}"
 httpApi:
   deployments:
     local:
