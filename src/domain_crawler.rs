@@ -18,6 +18,8 @@ pub struct UrlProcessingConfig {
     pub boost_words: Secret<Vec<String>>,
     #[config_schema(secret)]
     pub max_url_length: Secret<u32>,
+    #[config_schema(secret)]
+    pub allow_cross_domain: Secret<bool>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -100,6 +102,21 @@ impl DomainState {
 
     pub fn get_delay(&self) -> u32 {
         self.politeness_delay_ms
+    }
+
+    pub fn is_allowed_by_robots(&self, url: &url::Url) -> bool {
+        if let Some(ref disallowed_rules) = self.robots_disallowed {
+            let path = url.path();
+            let is_disallowed = disallowed_rules.iter().any(|prefix| {
+                if prefix == "/" {
+                    true
+                } else {
+                    path.starts_with(prefix)
+                }
+            });
+            return !is_disallowed;
+        }
+        true
     }
 }
 
@@ -204,7 +221,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         };
 
         // 2. Check compliance with robots.txt rules
-        if !self.is_allowed_by_robots(&target.url) {
+        if !self.state.is_allowed_by_robots(&target.url) {
             log::info!("URL disallowed by robots.txt, skipping: {}", target.url);
             self.schedule_next_step();
             return Ok(());
@@ -219,6 +236,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         let config = self.config.get();
         let max_url_len = config.url_processing.max_url_length.get();
         let boost_words = config.url_processing.boost_words.get();
+        let allow_cross_domain = config.url_processing.allow_cross_domain.get();
 
         match fetch_result {
             Ok(result) => {
@@ -230,7 +248,9 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
                     if link_str.len() as u32 > max_url_len {
                         continue;
                     }
-                    if let Some(domain) = get_domain_from_url(&link_str) {
+                    if let Some(domain) = get_domain_from_url(&link_str)
+                        && (domain == self.state.domain || allow_cross_domain)
+                    {
                         let priority = calculate_priority(&link_str, &boost_words);
                         grouped.entry(domain).or_default().push(PrioritizedUrl {
                             url: link_url,
@@ -244,7 +264,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
                         // Filter local URLs against our already cached robots.txt
                         let filtered_urls = urls
                             .into_iter()
-                            .filter(|u| self.is_allowed_by_robots(&u.url))
+                            .filter(|u| self.state.is_allowed_by_robots(&u.url))
                             .collect();
                         self.state.add_urls(filtered_urls);
                     } else {
@@ -264,21 +284,6 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 }
 
 impl DomainCrawlerAgentImpl {
-    fn is_allowed_by_robots(&self, url: &url::Url) -> bool {
-        if let Some(ref disallowed_rules) = self.state.robots_disallowed {
-            let path = url.path();
-            let is_disallowed = disallowed_rules.iter().any(|prefix| {
-                if prefix == "/" {
-                    true
-                } else {
-                    path.starts_with(prefix)
-                }
-            });
-            return !is_disallowed;
-        }
-        true
-    }
-
     async fn fetch_and_parse_robots(&self) -> (Vec<String>, Option<u32>) {
         let robots_url = format!("https://{}/robots.txt", self.state.domain);
         let client = golem_wasi_http::Client::new();

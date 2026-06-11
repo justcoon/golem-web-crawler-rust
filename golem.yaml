@@ -34,6 +34,7 @@ secretDefaults:
     urlProcessing:
       boostWords: ["/docs/", "/blog/", "/wiki/", "/article/"]
       maxUrlLength: 200
+      allowCrossDomain: false
 httpApi:
   deployments:
     local:
@@ -41,4 +42,5 @@ httpApi:
       agents:
         OrchestratorAgent: {}
         DomainCrawlerAgent: {}
+        SearchAgent: {}
 

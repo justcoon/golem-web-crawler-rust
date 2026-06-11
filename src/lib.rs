@@ -9,3 +9,6 @@ pub use domain_crawler::*;
 
 mod fetcher;
 pub use fetcher::*;
+
+mod search;
+pub use search::*;

@@ -101,6 +101,8 @@ pub struct UrlProcessingConfig {
     pub boost_words: Secret<Vec<String>>,
     #[config_schema(secret)]
     pub max_url_length: Secret<u32>,
+    #[config_schema(secret)]
+    pub allow_cross_domain: Secret<bool>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -266,6 +268,31 @@ pub trait FetcherAgent {
 }
 ```
 
+### 4. `src/search.rs`
+Contains the stateless `SearchAgent` worker querying the parsed contents via PostgreSQL Full-Text Search.
+
+```rust
+use golem_rust::{agent_definition, endpoint, Schema};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct SearchResultPage {
+    pub url: String,
+    pub title: String,
+    pub domain: String,
+    pub http_status: u16,
+    pub saved_at: String,
+}
+
+#[agent_definition(ephemeral, mount = "/search")]
+pub trait SearchAgent {
+    fn new(#[agent_config] config: Config<SearchConfig>) -> Self;
+
+    #[endpoint(get = "/")]
+    async fn search(&self, query: String) -> Result<Vec<SearchResultPage>, String>;
+}
+```
+
 ---
 
 ## Data Flow & State Management Strategy
@@ -279,4 +306,5 @@ To ensure memory remains bounded even when crawling millions of pages:
 5. **Clean up**: `DomainCrawlerAgent` receives the links and decrements `in_progress_count`.
 6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
 7. **Queue**: The remaining new prioritized URLs are merged into the `pending_queue` sorted by priority DESC (up to its maximum capacity limit).
+8. **Querying**: Users call `SearchAgent` which runs standard full-text indexing queries over the database contents.
 
