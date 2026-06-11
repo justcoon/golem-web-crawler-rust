@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct PrioritizedUrl {
-    pub url: String,
+    pub url: url::Url,
     pub priority: i32,
 }
 

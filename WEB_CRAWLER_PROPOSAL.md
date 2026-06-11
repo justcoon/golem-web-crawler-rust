@@ -194,7 +194,7 @@ use serde::{Deserialize, Serialize};
 // Shared model for referencing a URL and its queue priority
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct PrioritizedUrl {
-    pub url: String,
+    pub url: url::Url,
     pub priority: i32,
 }
 
@@ -250,9 +250,9 @@ pub enum FetcherError {
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct FetchResult {
-    pub url: String,
+    pub url: url::Url,
     pub title: String,
-    pub extracted_links: Vec<PrioritizedUrl>,
+    pub extracted_links: Vec<url::Url>,
     pub status: u16,
 }
 
@@ -262,7 +262,7 @@ pub trait FetcherAgent {
     fn new(#[agent_config] config: Config<FetcherConfig>) -> Self;
 
     // Fetch the page using golem-wasi-http and persist results to PostgreSQL
-    async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError>;
+    async fn fetch_and_parse(&self, url: url::Url) -> Result<FetchResult, FetcherError>;
 }
 ```
 

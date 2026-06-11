@@ -311,6 +311,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
+ "url",
  "uuid",
  "wasi-logger",
  "wasip2",
@@ -1035,6 +1036,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

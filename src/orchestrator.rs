@@ -50,10 +50,14 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
             std::collections::HashMap::new();
         for url in seeds {
             if let Some(domain) = get_domain_from_url(&url) {
-                grouped.entry(domain).or_default().push(PrioritizedUrl {
-                    url,
-                    priority: 10, // Default seed priority
-                });
+                if let Ok(parsed_url) = url::Url::parse(&url) {
+                    grouped.entry(domain).or_default().push(PrioritizedUrl {
+                        url: parsed_url,
+                        priority: 10, // Default seed priority
+                    });
+                } else {
+                    return Err(OrchestratorError::InvalidUrl { url });
+                }
             } else {
                 return Err(OrchestratorError::InvalidUrl { url });
             }

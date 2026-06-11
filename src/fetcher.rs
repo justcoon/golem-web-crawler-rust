@@ -1,4 +1,3 @@
-use crate::common::get_domain_from_url;
 use crate::common_lib::database::DatabaseHelper;
 use crate::common_lib::database::PostgresDbConfig;
 use crate::encode_params;
@@ -18,9 +17,9 @@ pub struct FetcherConfig {
 // Result of a fetch operation.
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct FetchResult {
-    pub url: String,
+    pub url: url::Url,
     pub title: String,
-    pub extracted_links: Vec<String>,
+    pub extracted_links: Vec<url::Url>,
     pub status: u16,
 }
 
@@ -46,7 +45,7 @@ pub enum FetcherError {
 #[agent_definition(ephemeral)]
 pub trait FetcherAgent {
     fn new(#[agent_config] config: Config<FetcherConfig>) -> Self;
-    async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError>;
+    async fn fetch_and_parse(&self, url: url::Url) -> Result<FetchResult, FetcherError>;
 }
 
 pub struct FetcherAgentImpl {
@@ -59,17 +58,11 @@ impl FetcherAgent for FetcherAgentImpl {
         Self { config }
     }
 
-    async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError> {
-        // Validate URL format
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(FetcherError::InvalidUrl {
-                url: url.clone(),
-                reason: "URL must start with http:// or https://".to_string(),
-            });
-        }
+    async fn fetch_and_parse(&self, url: url::Url) -> Result<FetchResult, FetcherError> {
+        let url_str = url.to_string();
 
         // Perform HTTP GET and extract body using helper
-        let (status, body) = self.fetch_body(&url).await?;
+        let (status, body) = self.fetch_body(&url_str).await?;
 
         // Extract title and links using helper
         let (title, extracted_links) = self.extract_content(&url, &body);
@@ -77,7 +70,7 @@ impl FetcherAgent for FetcherAgentImpl {
         // Persist result to PostgreSQL (ignore errors for now)
         let cfg = self.config.get();
         if let Ok(db_helper) = DatabaseHelper::from(cfg.db) {
-            let domain = get_domain_from_url(&url).unwrap_or_default();
+            let domain = url.host_str().unwrap_or_default().to_string();
             let _ = db_helper.transactional(|tx| {
                 let sql = "INSERT INTO page_contents (url, domain, title, http_status, raw_html, extracted_text) \
                            VALUES ($1, $2, $3, $4, $5, $6) \
@@ -88,7 +81,7 @@ impl FetcherAgent for FetcherAgentImpl {
                            raw_html = EXCLUDED.raw_html, \
                            extracted_text = EXCLUDED.extracted_text, \
                            saved_at = CURRENT_TIMESTAMP";
-                tx.execute(sql, encode_params!(&url, &domain, &title, &(status as i32), &body, &body))?;
+                tx.execute(sql, encode_params!(&url_str, &domain, &title, &(status as i32), &body, &body))?;
                 Ok(())
             });
         }
@@ -103,16 +96,15 @@ impl FetcherAgent for FetcherAgentImpl {
 }
 
 impl FetcherAgentImpl {
-    fn resolve_url(&self, base_url: &str, relative: &str) -> Option<String> {
-        let base = url::Url::parse(base_url).ok()?;
-        base.join(relative).ok().map(|u| u.into())
+    fn resolve_url(&self, base_url: &url::Url, relative: &str) -> Option<url::Url> {
+        base_url.join(relative).ok()
     }
 
-    fn extract_content(&self, base_url: &str, body: &str) -> (String, Vec<String>) {
+    fn extract_content(&self, base_url: &url::Url, body: &str) -> (String, Vec<url::Url>) {
         // Extract title using regex
         let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
         let title = title_regex
-            .captures(&body)
+            .captures(body)
             .and_then(|c| c.name("title"))
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
@@ -120,7 +112,7 @@ impl FetcherAgentImpl {
         // Simple link extraction (href attributes)
         let link_regex = Regex::new(r#"href\s*=\s*[\"']([^\"']+)[\"']"#).unwrap();
         let mut extracted_links = Vec::new();
-        for cap in link_regex.captures_iter(&body) {
+        for cap in link_regex.captures_iter(body) {
             if let Some(m) = cap.get(1) {
                 let link = m.as_str().to_string();
                 if !link.is_empty() && !link.starts_with("javascript:") {
