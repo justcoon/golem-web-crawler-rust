@@ -3,23 +3,96 @@ use crate::common::PrioritizedUrl;
 use crate::common_lib::database::PostgresDbConfig;
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
-use golem_rust::{agent_definition, agent_implementation, agentic::Config, endpoint, ConfigSchema, Schema};
+use golem_rust::{
+    ConfigSchema, Schema, agent_definition, agent_implementation, agentic::Config, endpoint,
+};
 use serde::{Deserialize, Serialize};
 
-#[derive(ConfigSchema)]
-pub struct DomainCrawlerConfig {
-    #[config_schema(nested)]
-    pub db: PostgresDbConfig,
+// #[derive(ConfigSchema)]
+// pub struct DomainCrawlerConfig {
+//     #[config_schema(nested)]
+//     pub db: PostgresDbConfig,
+// }
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum ProcessingStatus {
+    Inactive,
+    Scheduled,
+    Processing,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
-    // Queue of pending URLs sorted by priority DESC
+    // Queue of pending URLs sorted by priority ASC (so pop() returns highest priority)
     pub pending_queue: Vec<PrioritizedUrl>,
-    pub in_progress_count: u32,
-    pub is_active: bool,
+    pub status: ProcessingStatus,
+}
+
+impl DomainState {
+    pub fn new(domain: String) -> Self {
+        Self {
+            domain,
+            politeness_delay_ms: 1000,
+            pending_queue: Vec::new(),
+            status: ProcessingStatus::Inactive,
+        }
+    }
+
+    pub fn validate_url(&self, url: &str) -> bool {
+        url.contains(&self.domain)
+    }
+
+    pub fn add_urls(&mut self, urls: Vec<PrioritizedUrl>) {
+        for prioritized_url in urls {
+            if !self
+                .pending_queue
+                .iter()
+                .any(|u| u.url == prioritized_url.url)
+            {
+                self.pending_queue.push(prioritized_url);
+            }
+        }
+        // Sort by priority ASC so pop() returns highest priority
+        self.pending_queue.sort_by_key(|u| u.priority);
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending_queue.is_empty()
+    }
+
+    pub fn get_next_url(&mut self) -> Option<PrioritizedUrl> {
+        self.pending_queue.pop()
+    }
+
+    pub fn set_status(&mut self, status: ProcessingStatus) {
+        self.status = status;
+    }
+
+    pub fn get_status(&self) -> &ProcessingStatus {
+        &self.status
+    }
+
+    pub fn is_processing(&self) -> bool {
+        matches!(self.status, ProcessingStatus::Processing)
+    }
+
+    pub fn is_scheduled(&self) -> bool {
+        matches!(self.status, ProcessingStatus::Scheduled)
+    }
+
+    pub fn is_inactive(&self) -> bool {
+        matches!(self.status, ProcessingStatus::Inactive)
+    }
+
+    pub fn set_delay(&mut self, delay_ms: u32) {
+        self.politeness_delay_ms = delay_ms;
+    }
+
+    pub fn get_delay(&self) -> u32 {
+        self.politeness_delay_ms
+    }
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -33,7 +106,7 @@ pub enum DomainCrawlerError {
 #[agent_definition(mount = "/domains/{domain_name}")]
 pub trait DomainCrawlerAgent {
     // Constructor identifies the domain crawler instance.
-    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
+    fn new(domain_name: String) -> Self;
 
     // Enqueue new URLs discovered under this domain.
     async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError>;
@@ -51,30 +124,21 @@ pub trait DomainCrawlerAgent {
 }
 
 pub struct DomainCrawlerAgentImpl {
-    config: Config<DomainCrawlerConfig>,
     state: DomainState,
 }
 
 #[agent_implementation]
 impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
-    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self {
+    fn new(domain_name: String) -> Self {
         Self {
-            config,
-            state: DomainState {
-                domain: domain_name,
-                politeness_delay_ms: 1000, // Default 1 second
-                pending_queue: Vec::new(),
-                in_progress_count: 0,
-                is_active: false,
-            },
+            state: DomainState::new(domain_name),
         }
     }
 
     async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError> {
-        // 1. Validate all URLs first to ensure atomic enqueuing
+        // Validate all URLs first to ensure atomic enqueuing
         for prioritized_url in &urls {
-            // Very simple check: URL should contain domain name
-            if !prioritized_url.url.contains(&self.state.domain) {
+            if !self.state.validate_url(&prioritized_url.url) {
                 return Err(DomainCrawlerError::InvalidUrlForDomain {
                     url: prioritized_url.url.clone(),
                     domain: self.state.domain.clone(),
@@ -82,19 +146,12 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
             }
         }
 
-        // 2. Once validated, add non-duplicate URLs to the queue
-        for prioritized_url in urls {
-            if !self.state.pending_queue.iter().any(|u| u.url == prioritized_url.url) {
-                self.state.pending_queue.push(prioritized_url);
-            }
-        }
+        // Add URLs to the queue (handles duplicates and sorting)
+        self.state.add_urls(urls);
 
-        // Sort by priority DESC
-        self.state.pending_queue.sort_by_key(|u| -u.priority);
-
-        // Start processing if not already active and we have items
-        if !self.state.is_active && !self.state.pending_queue.is_empty() {
-            self.state.is_active = true;
+        // Start processing if inactive and we have items
+        if self.state.is_inactive() && self.state.has_pending() {
+            self.state.set_status(ProcessingStatus::Scheduled);
             let mut client = DomainCrawlerAgentClient::get(self.state.domain.clone());
             client.trigger_process_next();
         }
@@ -107,50 +164,39 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     }
 
     async fn set_delay(&mut self, delay_ms: u32) -> Result<(), DomainCrawlerError> {
-        self.state.politeness_delay_ms = delay_ms;
+        self.state.set_delay(delay_ms);
         Ok(())
     }
 
     async fn process_next(&mut self) -> Result<(), DomainCrawlerError> {
-        if self.state.pending_queue.is_empty() {
-            self.state.is_active = false;
+        if !self.state.has_pending() {
+            self.state.set_status(ProcessingStatus::Inactive);
             return Ok(());
         }
 
-        // Pop the highest priority URL (which is at the end if sorted, but we sorted it DESC so it's at the end or we can just pop)
-        // Wait, self.state.pending_queue.sort_by_key(|u| -u.priority) sorts DESC, so:
-        // High priority first in the vec, e.g., index 0. To pop high priority, we should remove from index 0,
-        // or sort ASC and pop from the end. Let's remove from index 0 for DESC, or sort ASC.
-        // Let's sort ASC so pop() returns the highest priority:
-        // pending_queue.sort_by_key(|u| u.priority);
-        // Let's adjust sorting so pop() takes the highest priority URL from the end:
-        self.state.pending_queue.sort_by_key(|u| u.priority);
-        let target = match self.state.pending_queue.pop() {
+        let target = match self.state.get_next_url() {
             Some(t) => t,
             None => {
-                self.state.is_active = false;
+                self.state.set_status(ProcessingStatus::Inactive);
                 return Ok(());
             }
         };
 
-        self.state.in_progress_count += 1;
+        self.state.set_status(ProcessingStatus::Processing);
 
         // Fetch using the FetcherAgent worker
         let fetcher = FetcherAgentClient::get();
         let fetch_result = fetcher.fetch_and_parse(target.url.clone()).await;
 
-        self.state.in_progress_count = self.state.in_progress_count.saturating_sub(1);
-
         match fetch_result {
             Ok(result) => {
-                // Parse extracted links and enqueue domain-specific ones
-                let mut domain_links = Vec::new();
-                for link in result.extracted_links {
-                    if link.url.contains(&self.state.domain) {
-                        domain_links.push(link);
-                    }
-                }
-                // Enqueue will add to queue and trigger another process_next if needed
+                // Filter and enqueue domain-specific links
+                let domain_links: Vec<PrioritizedUrl> = result
+                    .extracted_links
+                    .into_iter()
+                    .filter(|link| self.state.validate_url(&link.url))
+                    .collect();
+
                 let _ = self.enqueue(domain_links).await;
             }
             Err(e) => {
@@ -158,22 +204,23 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
             }
         }
 
-        // Schedule next URL processing if still active and queue has items
-        if self.state.is_active && !self.state.pending_queue.is_empty() {
-            let delay_ms = self.state.politeness_delay_ms;
+        // Schedule next URL processing if we have items
+        if self.state.has_pending() {
+            let delay_ms = self.state.get_delay();
             let delay_seconds = (delay_ms as f64 / 1000.0).ceil() as u64;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
 
+            self.state.set_status(ProcessingStatus::Scheduled);
             let mut client = DomainCrawlerAgentClient::get(self.state.domain.clone());
             client.schedule_process_next(Datetime {
                 seconds: now_secs + delay_seconds,
                 nanoseconds: 0,
             });
         } else {
-            self.state.is_active = false;
+            self.state.set_status(ProcessingStatus::Inactive);
         }
 
         Ok(())
