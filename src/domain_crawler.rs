@@ -1,11 +1,8 @@
 // src/domain_crawler.rs
 use crate::common::PrioritizedUrl;
-use crate::common_lib::database::PostgresDbConfig;
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
-use golem_rust::{
-    ConfigSchema, Schema, agent_definition, agent_implementation, agentic::Config, endpoint,
-};
+use golem_rust::{Schema, agent_definition, agent_implementation, endpoint};
 use serde::{Deserialize, Serialize};
 
 // #[derive(ConfigSchema)]
@@ -41,7 +38,9 @@ impl DomainState {
     }
 
     pub fn validate_url(&self, url: &str) -> bool {
-        url.contains(&self.domain)
+        get_domain_from_url(url)
+            .map(|d| d == self.domain)
+            .unwrap_or(false)
     }
 
     pub fn add_urls(&mut self, urls: Vec<PrioritizedUrl>) {
@@ -185,19 +184,28 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         self.state.set_status(ProcessingStatus::Processing);
 
         // Fetch using the FetcherAgent worker
-        let fetcher = FetcherAgentClient::get();
+        let fetcher = FetcherAgentClient::new_phantom();
         let fetch_result = fetcher.fetch_and_parse(target.url.clone()).await;
 
         match fetch_result {
             Ok(result) => {
-                // Filter and enqueue domain-specific links
-                let domain_links: Vec<PrioritizedUrl> = result
-                    .extracted_links
-                    .into_iter()
-                    .filter(|link| self.state.validate_url(&link.url))
-                    .collect();
+                // Group extracted links by domain and route to specific domain agents
+                let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
+                    std::collections::HashMap::new();
+                for link in result.extracted_links {
+                    if let Some(domain) = get_domain_from_url(&link.url) {
+                        grouped.entry(domain).or_default().push(link);
+                    }
+                }
 
-                let _ = self.enqueue(domain_links).await;
+                for (domain, urls) in grouped {
+                    if domain == self.state.domain {
+                        let _ = self.enqueue(urls).await;
+                    } else {
+                        let mut client = DomainCrawlerAgentClient::get(domain);
+                        client.trigger_enqueue(urls);
+                    }
+                }
             }
             Err(e) => {
                 log::error!("Failed to fetch URL {}: {:?}", target.url, e);
@@ -224,5 +232,33 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         }
 
         Ok(())
+    }
+}
+
+fn get_domain_from_url(url: &str) -> Option<String> {
+    let without_protocol = if url.starts_with("https://") {
+        &url[8..]
+    } else if url.starts_with("http://") {
+        &url[7..]
+    } else {
+        return None;
+    };
+
+    let end_of_host = without_protocol
+        .find('/')
+        .or_else(|| without_protocol.find('?'))
+        .or_else(|| without_protocol.find('#'))
+        .unwrap_or(without_protocol.len());
+
+    let host = &without_protocol[..end_of_host];
+    let host = if let Some(colon_idx) = host.find(':') {
+        &host[..colon_idx]
+    } else {
+        host
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }

@@ -45,7 +45,7 @@ pub enum FetcherError {
     },
 }
 
-#[agent_definition]
+#[agent_definition(ephemeral)]
 pub trait FetcherAgent {
     fn new(#[agent_config] config: Config<FetcherConfig>) -> Self;
     async fn fetch_and_parse(&self, url: String) -> Result<FetchResult, FetcherError>;
@@ -74,14 +74,21 @@ impl FetcherAgent for FetcherAgentImpl {
         let (status, body) = self.fetch_body(&url).await?;
 
         // Extract title and links using helper
-        let (title, extracted_links) = self.extract_content(&body);
+        let (title, extracted_links) = self.extract_content(&url, &body);
 
         // Persist result to PostgreSQL (ignore errors for now)
         let cfg = self.config.get();
         if let Ok(db_helper) = DatabaseHelper::from(cfg.db) {
             let _ = db_helper.transactional(|tx| {
-                let sql = "INSERT INTO fetch_results (url, title, status) VALUES ($1, $2, $3)";
-                tx.execute(sql, encode_params!(&url, &title, &(status as i32)))?;
+                let sql = "INSERT INTO page_contents (url, title, http_status, raw_html, extracted_text) \
+                           VALUES ($1, $2, $3, $4, $5) \
+                           ON CONFLICT (url) DO UPDATE SET \
+                           title = EXCLUDED.title, \
+                           http_status = EXCLUDED.http_status, \
+                           raw_html = EXCLUDED.raw_html, \
+                           extracted_text = EXCLUDED.extracted_text, \
+                           saved_at = CURRENT_TIMESTAMP";
+                tx.execute(sql, encode_params!(&url, &title, &(status as i32), &body, &body))?;
                 Ok(())
             });
         }
@@ -96,7 +103,53 @@ impl FetcherAgent for FetcherAgentImpl {
 }
 
 impl FetcherAgentImpl {
-    fn extract_content(&self, body: &str) -> (String, Vec<PrioritizedUrl>) {
+    fn resolve_url(&self, base_url: &str, relative: &str) -> Option<String> {
+        if relative.starts_with("http://") || relative.starts_with("https://") {
+            return Some(relative.to_string());
+        }
+        if relative.starts_with("//") {
+            let proto = if base_url.starts_with("https:") {
+                "https:"
+            } else {
+                "http:"
+            };
+            return Some(format!("{}{}", proto, relative));
+        }
+
+        let proto = if base_url.starts_with("https://") {
+            "https://"
+        } else if base_url.starts_with("http://") {
+            "http://"
+        } else {
+            return None;
+        };
+
+        let without_proto = &base_url[proto.len()..];
+        let slash_idx = without_proto.find('/');
+        let host = match slash_idx {
+            Some(idx) => &without_proto[..idx],
+            None => without_proto,
+        };
+
+        if relative.starts_with('/') {
+            Some(format!("{}{}{}", proto, host, relative))
+        } else {
+            let path = match slash_idx {
+                Some(idx) => {
+                    let p = &without_proto[idx..];
+                    if let Some(last_slash) = p.rfind('/') {
+                        &p[..last_slash + 1]
+                    } else {
+                        "/"
+                    }
+                }
+                None => "/",
+            };
+            Some(format!("{}{}{}{}", proto, host, path, relative))
+        }
+    }
+
+    fn extract_content(&self, base_url: &str, body: &str) -> (String, Vec<PrioritizedUrl>) {
         // Extract title using regex
         let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
         let title = title_regex
@@ -112,10 +165,12 @@ impl FetcherAgentImpl {
             if let Some(m) = cap.get(1) {
                 let link = m.as_str().to_string();
                 if !link.is_empty() && !link.starts_with("javascript:") {
-                    extracted_links.push(PrioritizedUrl {
-                        url: link,
-                        priority: 0,
-                    });
+                    if let Some(resolved) = self.resolve_url(base_url, &link) {
+                        extracted_links.push(PrioritizedUrl {
+                            url: resolved,
+                            priority: 0,
+                        });
+                    }
                 }
             }
         }

@@ -39,44 +39,17 @@ graph TD
 
 ## Recommended Database Schema & Migrations
 
-To enable fast deduplication and keep Golem agent state lightweight, we separate the crawl queue tracking from the crawled page output.
+The database stores crawled page content and results. Since `DomainCrawlerAgent` is a durable agent, it maintains the queue of pending URLs in its persistent memory, eliminating the need for a separate queue table in the database.
 
 The migration script containing the DDL definitions is located at:
 *   [V1__Create_Crawler_Tables.sql](migrations/V1__Create_Crawler_Tables.sql)
 
-### 1. `crawl_frontier` Table
-Tracks queue state, status, priority, and crawl depth. Indexed by `url_hash` for $O(1)$ deduplication.
-
-```sql
-CREATE TABLE crawl_frontier (
-    -- SHA-256 hash of URL for O(1) deduplication check
-    url_hash VARCHAR(64) PRIMARY KEY, 
-    url TEXT NOT NULL,
-    domain VARCHAR(255) NOT NULL,
-    
-    -- Status: 'PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED'
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    
-    -- Priority: Higher values are crawled first
-    priority INT NOT NULL DEFAULT 0,
-    depth INT NOT NULL DEFAULT 0,
-    
-    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    crawled_at TIMESTAMP WITH TIME ZONE,
-    error_message TEXT
-);
-
--- Index for DomainCrawlerAgent to load high-priority pending URLs quickly
-CREATE INDEX idx_frontier_domain_status_priority 
-ON crawl_frontier(domain, status, priority DESC, discovered_at ASC);
-```
-
-### 2. `page_contents` Table
-Stores raw crawled HTML and parsed text, decoupled from the lightweight queue table.
+### `page_contents` Table
+Stores raw crawled HTML, title, HTTP status, and parsed text. The `url` is used directly as the primary key.
 
 ```sql
 CREATE TABLE page_contents (
-    url_hash VARCHAR(64) PRIMARY KEY REFERENCES crawl_frontier(url_hash) ON DELETE CASCADE,
+    url TEXT PRIMARY KEY,
     title VARCHAR(512),
     http_status INT,
     raw_html TEXT,
@@ -305,7 +278,7 @@ To ensure memory remains bounded even when crawling millions of pages:
 1. **Start**: `DomainCrawlerAgent` pops the next URL from `pending_queue` and increments `in_progress_count`.
 2. **Execute**: It invokes the `FetcherAgent` with the URL.
 3. **Fetch (`golem-wasi-http`)**: `FetcherAgent` fetches the page content using `golem-wasi-http::Client`.
-4. **Persist (Postgres)**: `FetcherAgent` inserts the content to PostgreSQL, marks the URL as **Processed** in the database, and returns all extracted hyperlinks (with assigned priorities).
+4. **Persist (Postgres)**: `FetcherAgent` performs an UPSERT to insert or update the crawled content in the `page_contents` table in the database, and returns all extracted hyperlinks (with assigned priorities).
 5. **Clean up**: `DomainCrawlerAgent` receives the links and decrements `in_progress_count`.
 6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
 7. **Queue**: The remaining new prioritized URLs are merged into the `pending_queue` sorted by priority DESC (up to its maximum capacity limit).
