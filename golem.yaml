@@ -31,10 +31,14 @@ secretDefaults:
     db:
       user: "{{ POSTGRES_USER }}"
       password: "{{ POSTGRES_PASSWORD }}"
+    urlProcessing:
+      boostWords: ["/docs/", "/blog/", "/wiki/", "/article/"]
+      maxUrlLength: 200
 httpApi:
   deployments:
     local:
     - domain: golem-web-crawler-rust.localhost:9006
       agents:
-        CounterAgent: {}
         OrchestratorAgent: {}
+        DomainCrawlerAgent: {}
+

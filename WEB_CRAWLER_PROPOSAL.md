@@ -92,7 +92,15 @@ use serde::{Deserialize, Serialize};
 #[derive(ConfigSchema)]
 pub struct DomainCrawlerConfig {
     #[config_schema(nested)]
-    pub db: PostgresDbConfig,
+    pub url_processing: UrlProcessingConfig,
+}
+
+#[derive(ConfigSchema)]
+pub struct UrlProcessingConfig {
+    #[config_schema(secret)]
+    pub boost_words: Secret<Vec<String>>,
+    #[config_schema(secret)]
+    pub max_url_length: Secret<u32>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]

@@ -2,14 +2,23 @@
 use crate::common::{PrioritizedUrl, get_domain_from_url};
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
-use golem_rust::{Schema, agent_definition, agent_implementation, endpoint};
+use golem_rust::{ConfigSchema, Schema, agent_definition, agent_implementation, endpoint};
+use golem_rust::agentic::{Config, Secret};
 use serde::{Deserialize, Serialize};
 
-// #[derive(ConfigSchema)]
-// pub struct DomainCrawlerConfig {
-//     #[config_schema(nested)]
-//     pub db: PostgresDbConfig,
-// }
+#[derive(ConfigSchema)]
+pub struct DomainCrawlerConfig {
+    #[config_schema(nested)]
+    pub url_processing: UrlProcessingConfig,
+}
+
+#[derive(ConfigSchema)]
+pub struct UrlProcessingConfig {
+    #[config_schema(secret)]
+    pub boost_words: Secret<Vec<String>>,
+    #[config_schema(secret)]
+    pub max_url_length: Secret<u32>,
+}
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum ProcessingStatus {
@@ -105,7 +114,7 @@ pub enum DomainCrawlerError {
 #[agent_definition(mount = "/domains/{domain_name}")]
 pub trait DomainCrawlerAgent {
     // Constructor identifies the domain crawler instance.
-    fn new(domain_name: String) -> Self;
+    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
 
     // Enqueue new URLs discovered under this domain.
     async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError>;
@@ -124,13 +133,15 @@ pub trait DomainCrawlerAgent {
 
 pub struct DomainCrawlerAgentImpl {
     state: DomainState,
+    config: Config<DomainCrawlerConfig>,
 }
 
 #[agent_implementation]
 impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
-    fn new(domain_name: String) -> Self {
+    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self {
         Self {
             state: DomainState::new(domain_name),
+            config,
         }
     }
 
@@ -187,14 +198,21 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         let fetcher = FetcherAgentClient::new_phantom();
         let fetch_result = fetcher.fetch_and_parse(target.url.clone()).await;
 
+        let config = self.config.get();
+        let max_url_len = config.url_processing.max_url_length.get();
+        let boost_words = config.url_processing.boost_words.get();
+
         match fetch_result {
             Ok(result) => {
                 // Group extracted links by domain and route to specific domain agents
                 let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
                     std::collections::HashMap::new();
                 for link in result.extracted_links {
+                    if link.len() as u32 > max_url_len {
+                        continue;
+                    }
                     if let Some(domain) = get_domain_from_url(&link) {
-                        let priority = calculate_priority(&link);
+                        let priority = calculate_priority(&link, &boost_words);
                         grouped.entry(domain).or_default().push(PrioritizedUrl {
                             url: link,
                             priority,
@@ -239,7 +257,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     }
 }
 
-fn calculate_priority(url: &str) -> i32 {
+fn calculate_priority(url: &str, boost_words: &[String]) -> i32 {
     let mut priority = 10;
 
     // Path depth penalty (e.g. -1 for each path segment)
@@ -260,12 +278,11 @@ fn calculate_priority(url: &str) -> i32 {
     }
 
     // Keyword boosts
-    if url.contains("/docs/")
-        || url.contains("/blog/")
-        || url.contains("/wiki/")
-        || url.contains("/article/")
-    {
-        priority += 2;
+    for word in boost_words {
+        if url.contains(word) {
+            priority += 2;
+            break;
+        }
     }
 
     priority

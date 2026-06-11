@@ -1,9 +1,6 @@
 pub mod common;
 pub mod common_lib;
 
-mod counter_agent;
-pub use counter_agent::*;
-
 mod orchestrator;
 pub use orchestrator::*;
 
