@@ -107,9 +107,9 @@ pub struct UrlProcessingConfig {
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
-    // Queue of pending URLs sorted by priority DESC
     pub pending_queue: Vec<PrioritizedUrl>,
-    pub in_progress_count: u32,
+    pub status: ProcessingStatus,
+    pub robots_disallowed: Option<Vec<String>>,
 }
 ```
 
@@ -210,7 +210,8 @@ pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
     pub pending_queue: Vec<PrioritizedUrl>, // Sorted by priority DESC
-    pub in_progress_count: u32,
+    pub status: ProcessingStatus,
+    pub robots_disallowed: Option<Vec<String>>, // None means not fetched yet
 }
 
 #[agent_definition(mount = "/domains/{domain_name}")]

@@ -34,6 +34,7 @@ pub struct DomainState {
     // Queue of pending URLs sorted by priority ASC (so pop() returns highest priority)
     pub pending_queue: Vec<PrioritizedUrl>,
     pub status: ProcessingStatus,
+    pub robots_disallowed: Option<Vec<String>>,
 }
 
 impl DomainState {
@@ -43,6 +44,7 @@ impl DomainState {
             politeness_delay_ms: 1000,
             pending_queue: Vec::new(),
             status: ProcessingStatus::Inactive,
+            robots_disallowed: None,
         }
     }
 
@@ -184,6 +186,17 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
             return Ok(());
         }
 
+        // 1. Ensure robots.txt rules are fetched and cached
+        if self.state.robots_disallowed.is_none() {
+            log::info!("Fetching robots.txt for domain: {}", self.state.domain);
+            let (disallowed, delay_ms) = self.fetch_and_parse_robots().await;
+            self.state.robots_disallowed = Some(disallowed);
+            if let Some(delay) = delay_ms {
+                log::info!("Setting politeness delay to {}ms from Crawl-delay", delay);
+                self.state.set_delay(delay);
+            }
+        }
+
         let target = match self.state.get_next_url() {
             Some(t) => t,
             None => {
@@ -191,6 +204,27 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
                 return Ok(());
             }
         };
+
+        // 2. Check compliance with robots.txt rules
+        if let Some(ref disallowed_rules) = self.state.robots_disallowed {
+            if let Ok(parsed_url) = url::Url::parse(&target.url) {
+                let path = parsed_url.path();
+                let is_disallowed = disallowed_rules.iter().any(|prefix| {
+                    if prefix == "/" {
+                        true
+                    } else {
+                        path.starts_with(prefix)
+                    }
+                });
+
+                if is_disallowed {
+                    log::info!("URL disallowed by robots.txt, skipping: {}", target.url);
+                    // Skip and schedule next
+                    self.schedule_next_step();
+                    return Ok(());
+                }
+            }
+        }
 
         self.state.set_status(ProcessingStatus::Processing);
 
@@ -234,7 +268,36 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
             }
         }
 
-        // Schedule next URL processing if we have items
+        self.schedule_next_step();
+        Ok(())
+    }
+}
+
+impl DomainCrawlerAgentImpl {
+    async fn fetch_and_parse_robots(&self) -> (Vec<String>, Option<u32>) {
+        let robots_url = format!("https://{}/robots.txt", self.state.domain);
+        let client = golem_wasi_http::Client::new();
+        let response = match client.get(&robots_url).send() {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::warn!("Failed to fetch robots.txt for {}: {:?}", self.state.domain, e);
+                return (Vec::new(), None);
+            }
+        };
+
+        if response.status().as_u16() != 200 {
+            return (Vec::new(), None);
+        }
+
+        let body = match response.text() {
+            Ok(t) => t,
+            Err(_) => return (Vec::new(), None),
+        };
+
+        parse_robots_txt(&body)
+    }
+
+    fn schedule_next_step(&mut self) {
         if self.state.has_pending() {
             let delay_ms = self.state.get_delay();
             let delay_seconds = (delay_ms as f64 / 1000.0).ceil() as u64;
@@ -252,10 +315,48 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         } else {
             self.state.set_status(ProcessingStatus::Inactive);
         }
-
-        Ok(())
     }
 }
+
+fn parse_robots_txt(content: &str) -> (Vec<String>, Option<u32>) {
+    let mut disallowed = Vec::new();
+    let mut crawl_delay = None;
+    let mut in_relevant_agent = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let key = parts[0].trim().to_lowercase();
+        let val = parts[1].trim();
+
+        if key == "user-agent" {
+            let agent = val.to_lowercase();
+            // We target '*' or 'golem'
+            in_relevant_agent = agent == "*" || agent == "golem";
+        } else if in_relevant_agent {
+            if key == "disallow" {
+                if !val.is_empty() {
+                    disallowed.push(val.to_string());
+                }
+            } else if key == "crawl-delay" {
+                if let Ok(secs) = val.parse::<f64>() {
+                    crawl_delay = Some((secs * 1000.0) as u32);
+                }
+            }
+        }
+    }
+
+    (disallowed, crawl_delay)
+}
+
 
 fn calculate_priority(url: &str, boost_words: &[String]) -> i32 {
     let mut priority = 10;
