@@ -1,5 +1,5 @@
 // src/domain_crawler.rs
-use crate::common::PrioritizedUrl;
+use crate::common::{PrioritizedUrl, get_domain_from_url};
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
 use golem_rust::{Schema, agent_definition, agent_implementation, endpoint};
@@ -193,14 +193,18 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
                 let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
                     std::collections::HashMap::new();
                 for link in result.extracted_links {
-                    if let Some(domain) = get_domain_from_url(&link.url) {
-                        grouped.entry(domain).or_default().push(link);
+                    if let Some(domain) = get_domain_from_url(&link) {
+                        let priority = calculate_priority(&link);
+                        grouped.entry(domain).or_default().push(PrioritizedUrl {
+                            url: link,
+                            priority,
+                        });
                     }
                 }
 
                 for (domain, urls) in grouped {
                     if domain == self.state.domain {
-                        let _ = self.enqueue(urls).await;
+                        self.state.add_urls(urls);
                     } else {
                         let mut client = DomainCrawlerAgentClient::get(domain);
                         client.trigger_enqueue(urls);
@@ -235,30 +239,34 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     }
 }
 
-fn get_domain_from_url(url: &str) -> Option<String> {
-    let without_protocol = if url.starts_with("https://") {
-        &url[8..]
-    } else if url.starts_with("http://") {
-        &url[7..]
-    } else {
-        return None;
-    };
+fn calculate_priority(url: &str) -> i32 {
+    let mut priority = 10;
 
-    let end_of_host = without_protocol
-        .find('/')
-        .or_else(|| without_protocol.find('?'))
-        .or_else(|| without_protocol.find('#'))
-        .unwrap_or(without_protocol.len());
-
-    let host = &without_protocol[..end_of_host];
-    let host = if let Some(colon_idx) = host.find(':') {
-        &host[..colon_idx]
-    } else {
-        host
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
+    // Path depth penalty (e.g. -1 for each path segment)
+    if let Some(path_idx) = url.find("://") {
+        let path_part = &url[path_idx + 3..];
+        if let Some(slash_idx) = path_part.find('/') {
+            let segments = path_part[slash_idx..]
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .count();
+            priority -= segments as i32;
+        }
     }
+
+    // Query parameter penalty
+    if url.contains('?') {
+        priority -= 2;
+    }
+
+    // Keyword boosts
+    if url.contains("/docs/")
+        || url.contains("/blog/")
+        || url.contains("/wiki/")
+        || url.contains("/article/")
+    {
+        priority += 2;
+    }
+
+    priority
 }

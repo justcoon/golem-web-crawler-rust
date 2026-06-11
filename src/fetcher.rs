@@ -1,5 +1,4 @@
-// src/fetcher.rs
-use crate::common::PrioritizedUrl;
+use crate::common::get_domain_from_url;
 use crate::common_lib::database::DatabaseHelper;
 use crate::common_lib::database::PostgresDbConfig;
 use crate::encode_params;
@@ -21,8 +20,7 @@ pub struct FetcherConfig {
 pub struct FetchResult {
     pub url: String,
     pub title: String,
-    // Links extracted from the page along with priority information
-    pub extracted_links: Vec<PrioritizedUrl>,
+    pub extracted_links: Vec<String>,
     pub status: u16,
 }
 
@@ -79,16 +77,18 @@ impl FetcherAgent for FetcherAgentImpl {
         // Persist result to PostgreSQL (ignore errors for now)
         let cfg = self.config.get();
         if let Ok(db_helper) = DatabaseHelper::from(cfg.db) {
+            let domain = get_domain_from_url(&url).unwrap_or_default();
             let _ = db_helper.transactional(|tx| {
-                let sql = "INSERT INTO page_contents (url, title, http_status, raw_html, extracted_text) \
-                           VALUES ($1, $2, $3, $4, $5) \
+                let sql = "INSERT INTO page_contents (url, domain, title, http_status, raw_html, extracted_text) \
+                           VALUES ($1, $2, $3, $4, $5, $6) \
                            ON CONFLICT (url) DO UPDATE SET \
+                           domain = EXCLUDED.domain, \
                            title = EXCLUDED.title, \
                            http_status = EXCLUDED.http_status, \
                            raw_html = EXCLUDED.raw_html, \
                            extracted_text = EXCLUDED.extracted_text, \
                            saved_at = CURRENT_TIMESTAMP";
-                tx.execute(sql, encode_params!(&url, &title, &(status as i32), &body, &body))?;
+                tx.execute(sql, encode_params!(&url, &domain, &title, &(status as i32), &body, &body))?;
                 Ok(())
             });
         }
@@ -104,52 +104,11 @@ impl FetcherAgent for FetcherAgentImpl {
 
 impl FetcherAgentImpl {
     fn resolve_url(&self, base_url: &str, relative: &str) -> Option<String> {
-        if relative.starts_with("http://") || relative.starts_with("https://") {
-            return Some(relative.to_string());
-        }
-        if relative.starts_with("//") {
-            let proto = if base_url.starts_with("https:") {
-                "https:"
-            } else {
-                "http:"
-            };
-            return Some(format!("{}{}", proto, relative));
-        }
-
-        let proto = if base_url.starts_with("https://") {
-            "https://"
-        } else if base_url.starts_with("http://") {
-            "http://"
-        } else {
-            return None;
-        };
-
-        let without_proto = &base_url[proto.len()..];
-        let slash_idx = without_proto.find('/');
-        let host = match slash_idx {
-            Some(idx) => &without_proto[..idx],
-            None => without_proto,
-        };
-
-        if relative.starts_with('/') {
-            Some(format!("{}{}{}", proto, host, relative))
-        } else {
-            let path = match slash_idx {
-                Some(idx) => {
-                    let p = &without_proto[idx..];
-                    if let Some(last_slash) = p.rfind('/') {
-                        &p[..last_slash + 1]
-                    } else {
-                        "/"
-                    }
-                }
-                None => "/",
-            };
-            Some(format!("{}{}{}{}", proto, host, path, relative))
-        }
+        let base = url::Url::parse(base_url).ok()?;
+        base.join(relative).ok().map(|u| u.into())
     }
 
-    fn extract_content(&self, base_url: &str, body: &str) -> (String, Vec<PrioritizedUrl>) {
+    fn extract_content(&self, base_url: &str, body: &str) -> (String, Vec<String>) {
         // Extract title using regex
         let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
         let title = title_regex
@@ -166,10 +125,7 @@ impl FetcherAgentImpl {
                 let link = m.as_str().to_string();
                 if !link.is_empty() && !link.starts_with("javascript:") {
                     if let Some(resolved) = self.resolve_url(base_url, &link) {
-                        extracted_links.push(PrioritizedUrl {
-                            url: resolved,
-                            priority: 0,
-                        });
+                        extracted_links.push(resolved);
                     }
                 }
             }

@@ -12,14 +12,14 @@ A distributed, durable, and highly scalable web crawler designed to leverage **G
 
 ```mermaid
 graph TD
-    User["User / API Client"] -->|1. Start Crawl| Orchestrator["OrchestratorAgent (Durable)"]
+    User["User / API Client"] -->|1. Start Crawl| Orchestrator["OrchestratorAgent (Ephemeral)"]
     Orchestrator -->|2. Register/Route URL| DomainAgent["DomainCrawlerAgent (Durable)"]
     DomainAgent -->|3. Fetch & Parse| Fetcher["FetcherAgent (Ephemeral / Worker)"]
     Fetcher -->|4. Outgoing HTTP Request via golem-wasi-http| Web["External Website"]
-    Fetcher -->|5. Store Content & Mark Processed via Golem Postgres| DB[(PostgreSQL)]
+    Fetcher -->|5. Store Content via Golem Postgres| DB[(PostgreSQL)]
     Fetcher -->|6. Return Extracted Links| DomainAgent
     DomainAgent -->|7. Query DB for Unvisited Links| DB
-    DomainAgent -->|8. Report New Unvisited Links| Orchestrator
+    DomainAgent -->|8. Forward Cross-Domain Links via RPC| OtherDomainAgent["Other DomainCrawlerAgent (Durable)"]
 ```
 
 ---
@@ -111,7 +111,7 @@ Each agent’s constructor now takes a `#[agent_config] Config<…>` parameter:
 
 ```rust
 // Example for OrchestratorAgent
-fn new(crawl_job_id: String, #[agent_config] config: Config<OrchestratorConfig>) -> Self;
+fn new(#[agent_config] config: Config<OrchestratorConfig>) -> Self;
 ```
 
 The implementation stores the `Config` value inside the agent struct and uses it when creating a `DatabaseHelper`:
@@ -149,7 +149,7 @@ secretDefaults:
 These changes enable each agent to obtain its own database credentials and simplify testing and deployment across environments.
 
 ---
-Contains `OrchestratorAgent`, its status models, and errors.
+Contains `OrchestratorAgent` and its error types.
 
 ```rust
 use golem_rust::{agent_definition, endpoint, Schema};
@@ -158,33 +158,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum OrchestratorError {
     EmptySeedList,
-    CrawlJobAlreadyActive { job_id: String },
-    InvalidDomainRegistered { domain: String },
-    OrchestratorDBFailure { message: String },
+    InvalidUrl { url: String },
+    DatabaseError { message: String },
 }
 
-#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
-pub struct CrawlStatus {
-    pub job_id: String,
-    pub active_domains: Vec<String>,
-    pub total_domains_crawl_count: u32,
-}
-
-#[agent_definition(mount = "/crawlers/{crawl_job_id}")]
+#[agent_definition(ephemeral, mount = "/crawler")]
 pub trait OrchestratorAgent {
-    // Constructor parameter identifies the Orchestrator agent instance
-    fn new(crawl_job_id: String, #[agent_config] config: Config<OrchestratorConfig>) -> Self;
+    fn new(#[agent_config] config: Config<OrchestratorConfig>) -> Self;
 
     // Start a crawl session
     #[endpoint(post = "/start")]
-    async fn start_crawl(&mut self, seeds: Vec<String>) -> Result<(), OrchestratorError>;
+    async fn start_crawl(&self, seeds: Vec<String>) -> Result<(), OrchestratorError>;
 
-    // Get current crawl session statistics
-    #[endpoint(get = "/status")]
-    async fn get_status(&self) -> Result<CrawlStatus, OrchestratorError>;
-
-    // Add new URLs discovered during the crawl (internal RPC)
-    async fn add_urls(&mut self, urls: Vec<String>) -> Result<(), OrchestratorError>;
+    // Get all unique crawled domains from database
+    #[endpoint(get = "/domains")]
+    async fn get_domains(&self) -> Result<Vec<String>, OrchestratorError>;
 }
 ```
 

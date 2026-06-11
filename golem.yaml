@@ -37,3 +37,4 @@ httpApi:
     - domain: golem-web-crawler-rust.localhost:9006
       agents:
         CounterAgent: {}
+        OrchestratorAgent: {}
