@@ -57,9 +57,9 @@ impl SearchAgent for SearchAgentImpl {
                              @@ plainto_tsquery('english', $1) \
                        ORDER BY ts_rank(to_tsvector('english', coalesce(title, '') || ' ' || coalesce(extracted_text, '')), plainto_tsquery('english', $1)) DESC \
                        LIMIT 50";
-            
+
             let res = tx.query(sql, crate::encode_params!(&query))?;
-            
+
             use crate::common_lib::database::decode::DbResultDecoder;
             SearchResultPage::decode_result(res)
         }).map_err(|e| format!("Database query failed: {:?}", e))?;

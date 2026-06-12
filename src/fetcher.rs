@@ -62,10 +62,10 @@ impl FetcherAgent for FetcherAgentImpl {
         let url_str = url.to_string();
 
         // Perform HTTP GET and extract body using helper
-        let (status, body) = self.fetch_body(&url_str).await?;
+        let (status, body) = fetch_body(&url_str).await?;
 
         // Extract title and links using helper
-        let (title, extracted_links) = self.extract_content(&url, &body);
+        let (title, extracted_links) = extract_content(&url, &body);
 
         // Persist result to PostgreSQL (ignore errors for now)
         let cfg = self.config.get();
@@ -95,62 +95,62 @@ impl FetcherAgent for FetcherAgentImpl {
     }
 }
 
-impl FetcherAgentImpl {
-    fn resolve_url(&self, base_url: &url::Url, relative: &str) -> Option<url::Url> {
-        base_url.join(relative).ok()
-    }
+// Helper function to fetch body and status
+async fn fetch_body(url: &str) -> Result<(u16, String), FetcherError> {
+    let request = Request::get(url)
+        .header("Accept", HeaderValue::from_static("text/html"))
+        .body(Body::empty())
+        .expect("Failed to build request");
+    let mut response =
+        Client::new()
+            .send(request)
+            .await
+            .map_err(|e| FetcherError::HttpFetchFailed {
+                url: url.to_string(),
+                status_code: 0,
+                message: format!("{:?}", e),
+            })?;
+    let status = response.status().as_u16();
+    let body_bytes =
+        response
+            .body_mut()
+            .contents()
+            .await
+            .map_err(|e| FetcherError::HttpFetchFailed {
+                url: url.to_string(),
+                status_code: status,
+                message: format!("{:?}", e),
+            })?;
+    let body = String::from_utf8_lossy(body_bytes).to_string();
+    Ok((status, body))
+}
 
-    fn extract_content(&self, base_url: &url::Url, body: &str) -> (String, Vec<url::Url>) {
-        // Extract title using regex
-        let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
-        let title = title_regex
-            .captures(body)
-            .and_then(|c| c.name("title"))
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_default();
+fn resolve_url(base_url: &url::Url, relative: &str) -> Option<url::Url> {
+    base_url.join(relative).ok()
+}
 
-        // Simple link extraction (href attributes)
-        let link_regex = Regex::new(r#"href\s*=\s*[\"']([^\"']+)[\"']"#).unwrap();
-        let mut extracted_links = Vec::new();
-        for cap in link_regex.captures_iter(body) {
-            if let Some(m) = cap.get(1) {
-                let link = m.as_str().to_string();
-                if !link.is_empty() && !link.starts_with("javascript:") {
-                    if let Some(resolved) = self.resolve_url(base_url, &link) {
-                        extracted_links.push(resolved);
-                    }
-                }
+fn extract_content(base_url: &url::Url, body: &str) -> (String, Vec<url::Url>) {
+    // Extract title using regex
+    let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
+    let title = title_regex
+        .captures(body)
+        .and_then(|c| c.name("title"))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+
+    // Simple link extraction (href attributes)
+    let link_regex = Regex::new(r#"href\s*=\s*[\"']([^\"']+)[\"']"#).unwrap();
+    let mut extracted_links = Vec::new();
+    for cap in link_regex.captures_iter(body) {
+        if let Some(m) = cap.get(1) {
+            let link = m.as_str().to_string();
+            if !link.is_empty()
+                && !link.starts_with("javascript:")
+                && let Some(resolved) = resolve_url(base_url, &link)
+            {
+                extracted_links.push(resolved);
             }
         }
-        (title, extracted_links)
     }
-    // Helper function to fetch body and status
-    async fn fetch_body(&self, url: &str) -> Result<(u16, String), FetcherError> {
-        let request = Request::get(url)
-            .header("Accept", HeaderValue::from_static("text/html"))
-            .body(Body::empty())
-            .expect("Failed to build request");
-        let mut response =
-            Client::new()
-                .send(request)
-                .await
-                .map_err(|e| FetcherError::HttpFetchFailed {
-                    url: url.to_string(),
-                    status_code: 0,
-                    message: format!("{:?}", e),
-                })?;
-        let status = response.status().as_u16();
-        let body_bytes =
-            response
-                .body_mut()
-                .contents()
-                .await
-                .map_err(|e| FetcherError::HttpFetchFailed {
-                    url: url.to_string(),
-                    status_code: status,
-                    message: format!("{:?}", e),
-                })?;
-        let body = String::from_utf8_lossy(&body_bytes).to_string();
-        Ok((status, body))
-    }
+    (title, extracted_links)
 }

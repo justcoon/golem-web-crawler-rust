@@ -105,13 +105,21 @@ pub struct UrlProcessingConfig {
     pub allow_cross_domain: Secret<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Schema, Serialize, Deserialize)]
+pub enum PriorityBucket {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
-    pub pending_queue: Vec<PrioritizedUrl>,
+    pub queues: std::collections::HashMap<PriorityBucket, Vec<PrioritizedUrl>>,
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>,
+    pub rng_state: u32,
 }
 ```
 
@@ -207,13 +215,21 @@ pub enum DomainCrawlerError {
     ConfigurationError { message: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Schema, Serialize, Deserialize)]
+pub enum PriorityBucket {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
-    pub pending_queue: Vec<PrioritizedUrl>, // Sorted by priority DESC
+    pub queues: std::collections::HashMap<PriorityBucket, Vec<PrioritizedUrl>>,
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>, // None means not fetched yet
+    pub rng_state: u32,
 }
 
 #[agent_definition(mount = "/domains/{domain_name}")]
@@ -299,12 +315,12 @@ pub trait SearchAgent {
 
 To ensure memory remains bounded even when crawling millions of pages:
 
-1. **Start**: `DomainCrawlerAgent` pops the next URL from `pending_queue` and increments `in_progress_count`.
+1. **Start**: `DomainCrawlerAgent` selects and pops the next URL from one of its priority queue buckets in `queues` using a weighted lottery scheduling algorithm to prevent starvation (e.g. 70% High, 20% Medium, 10% Low) and increments `in_progress_count`.
 2. **Execute**: It invokes the `FetcherAgent` with the URL.
 3. **Fetch (`golem-wasi-http`)**: `FetcherAgent` fetches the page content using `golem-wasi-http::Client`.
 4. **Persist (Postgres)**: `FetcherAgent` performs an UPSERT to insert or update the crawled content in the `page_contents` table in the database, and returns all extracted hyperlinks (with assigned priorities).
 5. **Clean up**: `DomainCrawlerAgent` receives the links and decrements `in_progress_count`.
 6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
-7. **Queue**: The remaining new prioritized URLs are merged into the `pending_queue` sorted by priority DESC (up to its maximum capacity limit).
+7. **Queue**: The remaining new prioritized URLs are sorted into their respective `PriorityBucket` queues in `queues` depending on their priority values, and sorted by priority to keep them ordered.
 8. **Querying**: Users call `SearchAgent` which runs standard full-text indexing queries over the database contents.
 
