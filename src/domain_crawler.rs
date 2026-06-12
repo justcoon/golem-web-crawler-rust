@@ -1,5 +1,6 @@
 // src/domain_crawler.rs
 use crate::common::{PrioritizedUrl, get_domain_from_url};
+use crate::common_lib::database::{DatabaseHelper, PostgresDbConfig, Single};
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::agentic::{Config, Secret};
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
@@ -8,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(ConfigSchema)]
 pub struct DomainCrawlerConfig {
+    #[config_schema(nested)]
+    pub db: PostgresDbConfig,
     #[config_schema(nested)]
     pub url_processing: UrlProcessingConfig,
 }
@@ -311,7 +314,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 
                     match fetch_result {
                         Ok(result) => {
-                            self.process_extracted_links(result.extracted_links);
+                            self.process_extracted_links(result.extracted_links).await;
                         }
                         Err(e) => {
                             log::error!("Failed to fetch URL {}: {:?}", target.url, e);
@@ -331,15 +334,15 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 }
 
 impl DomainCrawlerAgentImpl {
-    fn process_extracted_links(&mut self, extracted_links: Vec<url::Url>) {
+    async fn process_extracted_links(&mut self, extracted_links: Vec<url::Url>) {
         let config = self.config.get();
         let max_url_len = config.url_processing.max_url_length.get();
         let boost_words = config.url_processing.boost_words.get();
         let allow_cross_domain = config.url_processing.allow_cross_domain.get();
+        let db_cfg = config.db;
 
-        // Group extracted links by domain and route to specific domain agents
-        let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
-            std::collections::HashMap::new();
+        // 1. Filter out URLs exceeding max length or domain constraints first
+        let mut candidate_urls = Vec::new();
         for link_url in extracted_links {
             let link_str = link_url.to_string();
             if link_str.len() as u32 > max_url_len {
@@ -348,6 +351,25 @@ impl DomainCrawlerAgentImpl {
             if let Some(domain) = get_domain_from_url(&link_str)
                 && (domain == self.state.domain || allow_cross_domain)
             {
+                candidate_urls.push(link_url);
+            }
+        }
+
+        // 2. Query DB to filter out already crawled URLs
+        let uncrawled_urls = match filter_uncrawled_urls(db_cfg, candidate_urls).await {
+            Ok(filtered) => filtered,
+            Err(e) => {
+                log::error!("Failed to filter uncrawled URLs: {:?}", e);
+                return;
+            }
+        };
+
+        // 3. Only now calculate priorities and group by domain
+        let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
+            std::collections::HashMap::new();
+        for link_url in uncrawled_urls {
+            let link_str = link_url.to_string();
+            if let Some(domain) = get_domain_from_url(&link_str) {
                 let priority = calculate_priority(&link_str, &boost_words);
                 grouped.entry(domain).or_default().push(PrioritizedUrl {
                     url: link_url,
@@ -384,6 +406,39 @@ impl DomainCrawlerAgentImpl {
         } else {
             self.state.set_status(ProcessingStatus::Inactive);
         }
+    }
+}
+
+async fn filter_uncrawled_urls(
+    db_cfg: PostgresDbConfig,
+    urls: Vec<url::Url>,
+) -> Result<Vec<url::Url>, DomainCrawlerError> {
+    if urls.is_empty() {
+        Ok(urls)
+    } else {
+        let db_helper =
+            DatabaseHelper::from(db_cfg).map_err(|e| DomainCrawlerError::ConfigurationError {
+                message: format!("Failed to connect to database: {:?}", e),
+            })?;
+
+        let url_strs: Vec<String> = urls.iter().map(|u| u.to_string()).collect();
+
+        let crawled_urls: std::collections::HashSet<String> = db_helper
+            .transactional(|tx| {
+                let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
+                let res = tx.query(sql, crate::encode_params!(&url_strs))?;
+                use crate::common_lib::database::decode::DbResultDecoder;
+                let rows = Single::<String>::decode_result(res)?;
+                Ok(rows.into_iter().map(|s| s.0).collect())
+            })
+            .map_err(|e| DomainCrawlerError::FetcherFailed {
+                message: format!("Failed to query crawled URLs: {:?}", e),
+            })?;
+
+        Ok(urls
+            .into_iter()
+            .filter(|u| !crawled_urls.contains(&u.to_string()))
+            .collect())
     }
 }
 
