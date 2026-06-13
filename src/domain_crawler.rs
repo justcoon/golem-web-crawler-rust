@@ -40,6 +40,8 @@ pub struct UrlProcessingConfig {
     pub max_url_length: Secret<u32>,
     #[config_schema(secret)]
     pub cross_domain_policy: Secret<String>,
+    #[config_schema(secret)]
+    pub normalize_prefixes: Secret<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -284,8 +286,10 @@ pub struct DomainCrawlerAgentImpl {
 #[agent_implementation]
 impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self {
+        let prefixes = config.get().url_processing.normalize_prefixes.get();
+        let normalized = crate::common::normalize_domain(&domain_name, &prefixes);
         Self {
-            state: DomainState::new(domain_name),
+            state: DomainState::new(normalized),
             config,
         }
     }
@@ -390,6 +394,7 @@ impl DomainCrawlerAgentImpl {
         let max_url_len = config.url_processing.max_url_length.get();
         let boost_words = config.url_processing.boost_words.get();
         let db_cfg = config.db;
+        let normalize_prefixes = config.url_processing.normalize_prefixes.get();
 
         let current_policy = self.state.cross_domain_policy.clone().unwrap_or_else(|| {
             let config_policy_str = config.url_processing.cross_domain_policy.get();
@@ -405,7 +410,11 @@ impl DomainCrawlerAgentImpl {
             }
             if let Some(domain) = link_url.host_str() {
                 let is_allowed = match current_policy {
-                    CrossDomainPolicy::None => domain == self.state.domain,
+                    CrossDomainPolicy::None => {
+                        let normalized_domain =
+                            crate::common::normalize_domain(domain, &normalize_prefixes);
+                        normalized_domain == self.state.domain
+                    }
                     CrossDomainPolicy::SubdomainsOnly => is_subdomain(domain, &self.state.domain),
                     CrossDomainPolicy::Any => true,
                 };
@@ -429,10 +438,12 @@ impl DomainCrawlerAgentImpl {
             std::collections::HashMap::new();
         for link_url in uncrawled_urls {
             if let Some(domain) = link_url.host_str() {
+                let normalized_domain =
+                    crate::common::normalize_domain(domain, &normalize_prefixes);
                 let link_str = link_url.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
                 grouped
-                    .entry(domain.to_string())
+                    .entry(normalized_domain)
                     .or_default()
                     .push(PrioritizedUrl {
                         url: link_url,

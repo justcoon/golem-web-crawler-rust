@@ -7,10 +7,14 @@ use golem_rust::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::domain_crawler::UrlProcessingConfig;
+
 #[derive(ConfigSchema)]
 pub struct OrchestratorConfig {
     #[config_schema(nested)]
     pub db: PostgresDbConfig,
+    #[config_schema(nested)]
+    pub url_processing: UrlProcessingConfig,
 }
 
 use crate::common::{FilterType, LinkFilter};
@@ -61,14 +65,18 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
             return Err(OrchestratorError::EmptySeedList);
         }
 
+        let normalize_prefixes = self.config.get().url_processing.normalize_prefixes.get();
+
         // Group seed URLs by domain
         let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
             std::collections::HashMap::new();
         for url in seeds {
             if let Ok(parsed_url) = url::Url::parse(&url) {
                 if let Some(domain) = parsed_url.host_str() {
+                    let normalized_domain =
+                        crate::common::normalize_domain(domain, &normalize_prefixes);
                     grouped
-                        .entry(domain.to_string())
+                        .entry(normalized_domain)
                         .or_default()
                         .push(PrioritizedUrl {
                             url: parsed_url,

@@ -18,6 +18,7 @@ pub struct FetcherConfig {
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct FetchResult {
     pub url: url::Url,
+    pub original_url: url::Url,
     pub title: String,
     pub extracted_links: Vec<url::Url>,
     pub status: u16,
@@ -62,7 +63,7 @@ impl FetcherAgent for FetcherAgentImpl {
         let url_str = url.to_string();
 
         // Perform HTTP GET and extract body using helper
-        let (status, body) = fetch_body(&url_str).await?;
+        let (status, body, final_url) = fetch_body(&url_str).await?;
 
         let cfg = self.config.get();
         let db_helper = DatabaseHelper::from(cfg.db).map_err(|e| FetcherError::DbError {
@@ -81,11 +82,12 @@ impl FetcherAgent for FetcherAgentImpl {
                 message: format!("Failed to load link filters: {:?}", e),
             })?;
 
-        // Extract title and links using helper
-        let (title, extracted_links) = extract_content(&url, &body, &active_filters);
+        // Extract title and links using helper (resolved relative to final redirected URL)
+        let (title, extracted_links) = extract_content(&final_url, &body, &active_filters);
 
         // Persist result to PostgreSQL
-        let domain = url.host_str().unwrap_or_default().to_string();
+        let final_url_str = final_url.to_string();
+        let domain = final_url.host_str().unwrap_or_default().to_string();
         db_helper
             .transactional(|tx| {
                 let sql = "INSERT INTO page_contents (url, domain, title, http_status, raw_html, extracted_text) \
@@ -97,7 +99,15 @@ impl FetcherAgent for FetcherAgentImpl {
                            raw_html = EXCLUDED.raw_html, \
                            extracted_text = EXCLUDED.extracted_text, \
                            saved_at = CURRENT_TIMESTAMP";
-                tx.execute(sql, encode_params!(&url_str, &domain, &title, &(status as i32), &body, &body))?;
+                tx.execute(sql, encode_params!(&final_url_str, &domain, &title, &(status as i32), &body, &body))?;
+
+                if final_url_str != url_str {
+                    let original_domain = url.host_str().unwrap_or_default().to_string();
+                    let sql_redirect = "INSERT INTO page_contents (url, domain, title, http_status) \
+                                       VALUES ($1, $2, $3, $4) \
+                                       ON CONFLICT (url) DO NOTHING";
+                    tx.execute(sql_redirect, encode_params!(&url_str, &original_domain, &"Redirect".to_string(), &(status as i32)))?;
+                }
                 Ok(())
             })
             .map_err(|e| FetcherError::DbError {
@@ -105,7 +115,8 @@ impl FetcherAgent for FetcherAgentImpl {
             })?;
 
         Ok(FetchResult {
-            url,
+            url: final_url,
+            original_url: url,
             title,
             extracted_links,
             status,
@@ -114,7 +125,7 @@ impl FetcherAgent for FetcherAgentImpl {
 }
 
 // Helper function to fetch body and status, following redirects and adding a User-Agent
-async fn fetch_body(url: &str) -> Result<(u16, String), FetcherError> {
+async fn fetch_body(url: &str) -> Result<(u16, String, url::Url), FetcherError> {
     let mut current_url = url.to_string();
     let mut redirect_count = 0;
     const MAX_REDIRECTS: u8 = 5;
@@ -185,7 +196,11 @@ async fn fetch_body(url: &str) -> Result<(u16, String), FetcherError> {
                     message: format!("{:?}", e),
                 })?;
         let body = String::from_utf8_lossy(body_bytes).to_string();
-        return Ok((status, body));
+        let final_url = url::Url::parse(&current_url).map_err(|e| FetcherError::InvalidUrl {
+            url: current_url.clone(),
+            reason: format!("Failed to parse final URL: {:?}", e),
+        })?;
+        return Ok((status, body, final_url));
     }
 }
 
