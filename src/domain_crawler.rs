@@ -15,6 +15,23 @@ pub struct DomainCrawlerConfig {
     pub url_processing: UrlProcessingConfig,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Schema, Serialize, Deserialize)]
+pub enum CrossDomainPolicy {
+    None,
+    SubdomainsOnly,
+    Any,
+}
+
+impl CrossDomainPolicy {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "subdomainsonly" | "subdomains_only" => CrossDomainPolicy::SubdomainsOnly,
+            "any" => CrossDomainPolicy::Any,
+            _ => CrossDomainPolicy::None,
+        }
+    }
+}
+
 #[derive(ConfigSchema)]
 pub struct UrlProcessingConfig {
     #[config_schema(secret)]
@@ -22,7 +39,7 @@ pub struct UrlProcessingConfig {
     #[config_schema(secret)]
     pub max_url_length: Secret<u32>,
     #[config_schema(secret)]
-    pub allow_cross_domain: Secret<bool>,
+    pub cross_domain_policy: Secret<String>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -55,6 +72,7 @@ impl PriorityBucket {
 pub struct DomainState {
     pub domain: String,
     pub politeness_delay_ms: u32,
+    pub cross_domain_policy: Option<CrossDomainPolicy>,
     pub queues: std::collections::HashMap<PriorityBucket, Vec<PrioritizedUrl>>,
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>,
@@ -72,6 +90,7 @@ impl DomainState {
         Self {
             domain,
             politeness_delay_ms: 1000,
+            cross_domain_policy: None,
             queues,
             status: ProcessingStatus::Inactive,
             robots_disallowed: None,
@@ -242,6 +261,17 @@ pub trait DomainCrawlerAgent {
     #[endpoint(post = "/config/delay")]
     async fn set_delay(&mut self, delay_ms: u32) -> Result<(), DomainCrawlerError>;
 
+    // Adjust cross-domain policy dynamically via REST.
+    #[endpoint(post = "/config/cross-domain-policy")]
+    async fn set_cross_domain_policy(
+        &mut self,
+        policy: CrossDomainPolicy,
+    ) -> Result<(), DomainCrawlerError>;
+
+    // Remove custom cross-domain policy and fallback to default configuration.
+    #[endpoint(delete = "/config/cross-domain-policy")]
+    async fn remove_cross_domain_policy(&mut self) -> Result<(), DomainCrawlerError>;
+
     // Processes the next URL in the queue (internal loop step).
     async fn process_next(&mut self) -> Result<(), DomainCrawlerError>;
 }
@@ -286,6 +316,19 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 
     async fn set_delay(&mut self, delay_ms: u32) -> Result<(), DomainCrawlerError> {
         self.state.set_delay(delay_ms);
+        Ok(())
+    }
+
+    async fn set_cross_domain_policy(
+        &mut self,
+        policy: CrossDomainPolicy,
+    ) -> Result<(), DomainCrawlerError> {
+        self.state.cross_domain_policy = Some(policy);
+        Ok(())
+    }
+
+    async fn remove_cross_domain_policy(&mut self) -> Result<(), DomainCrawlerError> {
+        self.state.cross_domain_policy = None;
         Ok(())
     }
 
@@ -337,13 +380,21 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     }
 }
 
+fn is_subdomain(sub: &str, parent: &str) -> bool {
+    sub == parent || sub.ends_with(&format!(".{}", parent))
+}
+
 impl DomainCrawlerAgentImpl {
     async fn process_extracted_links(&mut self, extracted_links: Vec<url::Url>) {
         let config = self.config.get();
         let max_url_len = config.url_processing.max_url_length.get();
         let boost_words = config.url_processing.boost_words.get();
-        let allow_cross_domain = config.url_processing.allow_cross_domain.get();
         let db_cfg = config.db;
+
+        let current_policy = self.state.cross_domain_policy.clone().unwrap_or_else(|| {
+            let config_policy_str = config.url_processing.cross_domain_policy.get();
+            CrossDomainPolicy::from_str(&config_policy_str)
+        });
 
         // 1. Filter out URLs exceeding max length or domain constraints first
         let mut candidate_urls = Vec::new();
@@ -352,10 +403,15 @@ impl DomainCrawlerAgentImpl {
             if link_str.len() as u32 > max_url_len {
                 continue;
             }
-            if let Some(domain) = link_url.host_str()
-                && (domain == self.state.domain || allow_cross_domain)
-            {
-                candidate_urls.push(link_url);
+            if let Some(domain) = link_url.host_str() {
+                let is_allowed = match current_policy {
+                    CrossDomainPolicy::None => domain == self.state.domain,
+                    CrossDomainPolicy::SubdomainsOnly => is_subdomain(domain, &self.state.domain),
+                    CrossDomainPolicy::Any => true,
+                };
+                if is_allowed {
+                    candidate_urls.push(link_url);
+                }
             }
         }
 
@@ -540,6 +596,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_is_subdomain() {
+        assert!(is_subdomain("golem.cloud", "golem.cloud"));
+        assert!(is_subdomain("learn.golem.cloud", "golem.cloud"));
+        assert!(is_subdomain("abc.xyz.golem.cloud", "golem.cloud"));
+        assert!(!is_subdomain("newdomain.com", "golem.cloud"));
+        assert!(!is_subdomain("othergolem.cloud", "golem.cloud"));
+        assert!(!is_subdomain("golem.cloud.net", "golem.cloud"));
+    }
+
+    #[test]
     fn test_domain_state_new() {
         let state = DomainState::new("example.com".to_string());
         assert_eq!(state.domain, "example.com");
@@ -548,6 +614,7 @@ mod tests {
         assert!(!state.has_pending());
         assert_eq!(state.processed_count, 0);
         assert_eq!(state.error_count, 0);
+        assert_eq!(state.cross_domain_policy, None);
     }
 
     #[test]
