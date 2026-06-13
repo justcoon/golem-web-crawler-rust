@@ -1,0 +1,430 @@
+# Golem-based Web Crawler Architecture Proposal (Rust)
+
+A distributed, durable, and highly scalable web crawler designed to leverage **Golem Cloud's core features**:
+*   **Durable Execution**: Automatic resumption of crawls if host nodes restart, with no lost progress.
+*   **Sequential Invocation**: Natural concurrency control per-agent, making rate-limiting and politeness constraints trivial to enforce without distributed locks.
+*   **Durable Retries**: Transparent retry mechanisms for transient HTTP fetch failures.
+*   **Stateless Offloading**: Ephemeral worker agents for memory-heavy HTTP fetching and HTML parsing to minimize Golem's persistent storage overhead.
+
+---
+
+## High-Level Architecture Diagram
+
+```mermaid
+graph TD
+    User["User / API Client"] -->|1. Start Crawl| Orchestrator["OrchestratorAgent (Ephemeral)"]
+    Orchestrator -->|2. Register/Route URL| DomainAgent["DomainCrawlerAgent (Durable)"]
+    DomainAgent -->|3. Fetch & Parse| Fetcher["FetcherAgent (Ephemeral / Worker)"]
+    Fetcher -->|4. Outgoing HTTP Request via golem-wasi-http| Web["External Website"]
+    Fetcher -->|5. Store Content via Golem Postgres| DB[(PostgreSQL)]
+    Fetcher -->|6. Return Extracted Links| DomainAgent
+    DomainAgent -->|7. Query DB for Unvisited Links| DB
+    DomainAgent -->|8. Forward Cross-Domain Links via RPC| OtherDomainAgent["Other DomainCrawlerAgent (Durable)"]
+```
+
+---
+
+## Technical Stack Selection
+
+### 1. HTTP Client: `golem-wasi-http`
+*   **Implementation**: Uses the `golem-wasi-http` client library (with `async` and `json` features enabled).
+*   **Benefits**: Reqwest-like builder APIs (`.get()`, `.post()`, `.bearer_auth()`, `.query()`, `.error_for_status()`) targeting WASI-HTTP. It integrates natively with Golem's durable retry policies.
+
+### 2. Database Integration: Golem RDBMS (`PostgreSQL`)
+*   **Library**: `golem_rust::bindings::golem::rdbms::postgres` (built-in Golem Host API).
+*   **Implementation**: Workers insert parsed results and update crawled state using transactional SQL commands.
+*   **Benefits**: Offloads the crawled page state from Golem's metadata logs to a dedicated PostgreSQL database, keeping the agent memory footprints tiny and bounded.
+
+---
+
+## Recommended Database Schema & Migrations
+
+The database stores crawled page content and results. Since `DomainCrawlerAgent` is a durable agent, it maintains the queue of pending URLs in its persistent memory, eliminating the need for a separate queue table in the database.
+
+The migration script containing the DDL definitions is located at:
+*   [V1__Create_Crawler_Tables.sql](migrations/V1__Create_Crawler_Tables.sql)
+
+### `page_contents` Table
+Stores raw crawled HTML, title, HTTP status, and parsed text. The `url` is used directly as the primary key.
+
+```sql
+CREATE TABLE page_contents (
+    url TEXT PRIMARY KEY,
+    title VARCHAR(512),
+    http_status INT,
+    raw_html TEXT,
+    extracted_text TEXT,
+    saved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## Modular Component and Agent Design
+
+Each agent is placed in its own dedicated Rust module along with its related schemas and error types. Shared data models (such as `PrioritizedUrl`) are maintained in a shared/common scope.
+
+### Configuration for Database Access
+
+To make each database‑accessing agent configurable we introduce a typed configuration struct that includes a `db: PostgresDbConfig` field. The structs derive `ConfigSchema` so they are automatically exposed in the Golem manifest.
+
+```rust
+// src/orchestrator.rs
+#[derive(ConfigSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    // Database connection details used by the orchestrator
+    pub db: PostgresDbConfig,
+    // (optional) future fields such as concurrency limits can be added here
+}
+
+// src/fetcher.rs
+#[derive(ConfigSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct FetcherConfig {
+    pub db: PostgresDbConfig,
+}
+
+// src/domain_crawler.rs
+use crate::common::PrioritizedUrl;
+use crate::common_lib::database::PostgresDbConfig;
+use golem_rust::{ConfigSchema, Schema, agent_definition, agentic::Config, endpoint};
+use serde::{Deserialize, Serialize};
+
+#[derive(ConfigSchema)]
+pub struct DomainCrawlerConfig {
+    #[config_schema(nested)]
+    pub url_processing: UrlProcessingConfig,
+}
+
+#[derive(ConfigSchema)]
+pub struct UrlProcessingConfig {
+    #[config_schema(secret)]
+    pub boost_words: Secret<Vec<String>>,
+    #[config_schema(secret)]
+    pub max_url_length: Secret<u32>,
+    #[config_schema(secret)]
+    pub allow_cross_domain: Secret<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Schema, Serialize, Deserialize)]
+pub enum PriorityBucket {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct DomainState {
+    pub domain: String,
+    pub politeness_delay_ms: u32,
+    pub queues: std::collections::HashMap<PriorityBucket, Vec<PrioritizedUrl>>,
+    pub status: ProcessingStatus,
+    pub robots_disallowed: Option<Vec<String>>,
+    pub rng_state: u32,
+    pub processed_count: u64,
+}
+```
+
+### How the config is passed to agents
+
+Each agent’s constructor now takes a `#[agent_config] Config<…>` parameter:
+
+```rust
+// Example for OrchestratorAgent
+fn new(#[agent_config] config: Config<OrchestratorConfig>) -> Self;
+```
+
+The implementation stores the `Config` value inside the agent struct and uses it when creating a `DatabaseHelper`:
+
+```rust
+let db_cfg = self.config.get().db;
+let db = DatabaseHelper::from(db_cfg)?;
+```
+
+### Manifest updates (`golem.yaml`)
+
+Add the configuration under each agent’s `config` section:
+
+```yaml
+agents:
+  OrchestratorAgent:
+    config:
+      db:
+        host: "{{ POSTGRES_HOST }}"
+        db: "{{ POSTGRES_DB }}"
+        port: "{{ POSTGRES_PORT }}"
+  FetcherAgent:
+    config:
+      db: *same-as-above
+  DomainCrawlerAgent:
+    config:
+      db: *same-as-above
+secretDefaults:
+  local:
+    db:
+      user: "{{ POSTGRES_USER }}"
+      password: "{{ POSTGRES_PASSWORD }}"
+```
+
+These changes enable each agent to obtain its own database credentials and simplify testing and deployment across environments.
+
+---
+
+### 1. `src/orchestrator.rs`
+Contains `OrchestratorAgent` and its error types.
+
+```rust
+use golem_rust::{agent_definition, endpoint, Schema};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum FilterType {
+    DomainBlacklist,
+    UrlRegex,
+    Keyword,
+    Extension,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct LinkFilter {
+    pub id: i32,
+    pub pattern: String,
+    pub filter_type: FilterType,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum OrchestratorError {
+    EmptySeedList,
+    InvalidUrl { url: String },
+    DbError { message: String },
+}
+
+#[agent_definition(ephemeral, mount = "/crawler")]
+pub trait OrchestratorAgent {
+    fn new(#[agent_config] config: Config<OrchestratorConfig>) -> Self;
+
+    // Start a crawl session
+    #[endpoint(post = "/start")]
+    async fn start_crawl(&self, seeds: Vec<String>) -> Result<(), OrchestratorError>;
+
+    // Get all unique crawled domains from database
+    #[endpoint(get = "/domains")]
+    async fn get_domains(&self) -> Result<Vec<String>, OrchestratorError>;
+
+    // Add a link filter pattern to exclude from crawls
+    #[endpoint(post = "/filters")]
+    async fn add_filter(&self, pattern: String, filter_type: FilterType) -> Result<(), OrchestratorError>;
+
+    // Get list of all link filters
+    #[endpoint(get = "/filters")]
+    async fn get_filters(&self) -> Result<Vec<LinkFilter>, OrchestratorError>;
+
+    // Remove a link filter pattern by ID
+    #[endpoint(delete = "/filters/{id}")]
+    async fn delete_filter(&self, id: i32) -> Result<(), OrchestratorError>;
+}
+```
+
+### 2. `src/domain_crawler.rs`
+Contains `DomainCrawlerAgent`, its configuration state, and errors.
+
+```rust
+use golem_rust::{agent_definition, endpoint, Schema};
+use serde::{Deserialize, Serialize};
+
+// Shared model for referencing a URL and its queue priority
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct PrioritizedUrl {
+    pub url: url::Url,
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum DomainCrawlerError {
+    QueueFull { max_size: usize },
+    InvalidUrlForDomain { url: String, domain: String },
+    ConfigurationError { message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Schema, Serialize, Deserialize)]
+pub enum PriorityBucket {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct DomainState {
+    pub domain: String,
+    pub politeness_delay_ms: u32,
+    pub queues: std::collections::HashMap<PriorityBucket, Vec<PrioritizedUrl>>,
+    pub status: ProcessingStatus,
+    pub robots_disallowed: Option<Vec<String>>, // None means not fetched yet
+    pub rng_state: u32,
+    pub processed_count: u64,
+}
+
+#[agent_definition(mount = "/domains/{domain_name}")]
+pub trait DomainCrawlerAgent {
+    // Constructor parameter identifies the Domain Crawler agent instance
+    fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
+
+    // Enqueue new unvisited URLs found under this domain
+    async fn enqueue(&mut self, urls: Vec<PrioritizedUrl>) -> Result<(), DomainCrawlerError>;
+
+    // Retrieve current in-memory queue status
+    #[endpoint(get = "/state")]
+    async fn get_state(&self) -> Result<DomainState, DomainCrawlerError>;
+
+    // Adjust politeness delay dynamically via REST
+    #[endpoint(post = "/config/delay")]
+    async fn set_delay(&mut self, delay_ms: u32) -> Result<(), DomainCrawlerError>;
+}
+```
+
+### 3. `src/fetcher.rs`
+Contains the stateless `FetcherAgent` worker using `golem-wasi-http` for outgoing HTTP requests.
+
+```rust
+use golem_rust::{agent_definition, Schema};
+use serde::{Deserialize, Serialize};
+use crate::domain_crawler::PrioritizedUrl;
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum FetcherError {
+    InvalidUrl { url: String, reason: String },
+    RobotsDisallowed { url: String },
+    HttpFetchFailed { url: String, status_code: u16, message: String },
+    DbError { message: String },
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct FetchResult {
+    pub url: url::Url,
+    pub title: String,
+    pub extracted_links: Vec<url::Url>,
+    pub status: u16,
+}
+
+#[agent_definition(ephemeral)]
+pub trait FetcherAgent {
+    // Constructor parameter identifies the fetcher worker instance
+    fn new(#[agent_config] config: Config<FetcherConfig>) -> Self;
+
+    // Fetch the page using golem-wasi-http and persist results to PostgreSQL
+    async fn fetch_and_parse(&self, url: url::Url) -> Result<FetchResult, FetcherError>;
+}
+```
+
+### 4. `src/search.rs`
+Contains the stateless `SearchAgent` worker querying the parsed contents via PostgreSQL Full-Text Search.
+
+```rust
+use golem_rust::{agent_definition, endpoint, Schema};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct SearchResultPage {
+    pub url: String,
+    pub title: String,
+    pub domain: String,
+    pub http_status: u16,
+    pub saved_at: String,
+}
+
+#[agent_definition(ephemeral, mount = "/search")]
+pub trait SearchAgent {
+    fn new(#[agent_config] config: Config<SearchConfig>) -> Self;
+
+    #[endpoint(get = "/")]
+    async fn search(&self, query: String) -> Result<Vec<SearchResultPage>, String>;
+}
+```
+
+---
+
+## Data Flow & State Management Strategy
+
+To ensure memory remains bounded even when crawling millions of pages:
+
+1. **Start**: `DomainCrawlerAgent` selects and pops the next URL from one of its priority queue buckets in `queues` using a weighted lottery scheduling algorithm to prevent starvation (e.g. 70% High, 20% Medium, 10% Low) and increments `in_progress_count`.
+2. **Execute**: It invokes the `FetcherAgent` with the URL.
+3. **Fetch (`golem-wasi-http`)**: `FetcherAgent` fetches the page content using `golem-wasi-http::Client`.
+4. **Persist (Postgres)**: `FetcherAgent` performs an UPSERT to insert or update the crawled content in the `page_contents` table in the database, and returns all extracted hyperlinks (with assigned priorities).
+5. **Clean up**: `DomainCrawlerAgent` receives the links and decrements `in_progress_count`.
+6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
+7. **Queue**: The remaining new prioritized URLs are sorted into their respective `PriorityBucket` queues in `queues` depending on their priority values, and sorted by priority to keep them ordered.
+8. **Querying**: Users call `SearchAgent` which runs standard full-text indexing queries over the database contents.
+
+---
+
+## URL and Content Filtering Strategy (Ads, Spam, Social Networks)
+
+To maintain crawl quality and prevent storing irrelevant link graphs, the system filters out advertisements, spam, tracker scripts, and social network links.
+
+### 1. Where Filtering is Applied
+
+Filtering is applied entirely during content extraction within the **`FetcherAgent`** itself.
+
+```mermaid
+flowchart TD
+    HTML[Raw HTML] --> Fetcher[FetcherAgent: fetch_and_parse]
+    DB[(PostgreSQL)] -->|Query active link_filters| Fetcher
+    Fetcher -->|Filter links during extraction| CleanLinks[Clean Extracted Links]
+    CleanLinks -->|Return via RPC| Domain[DomainCrawlerAgent]
+```
+
+* **Why**: Minimizes the size of the RPC response payload sent back to the `DomainCrawlerAgent` and reduces serialization/network overhead.
+* **How it works**: Before parsing the fetched HTML, `FetcherAgent` queries active filter rules from the database `link_filters` table and drops any matching URLs during link extraction.
+
+---
+
+### 2. Database Schema for Dynamic Filtering
+
+To support runtime updates to the blacklist without agent redeployments, we introduce a `link_filters` table in the database:
+
+```sql
+CREATE TABLE link_filters (
+    id SERIAL PRIMARY KEY,
+    pattern TEXT NOT NULL UNIQUE,       -- E.g., 'doubleclick.net', 'google-analytics.com', 'facebook.com'
+    filter_type VARCHAR(50) NOT NULL,   -- 'domain_blacklist', 'url_regex', 'keyword'
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Initial seed data is populated via migration scripts containing standard social network domains, popular ad-servers, and tracking patterns.
+
+### 3. Agent Configuration & Code Strategy
+
+#### Fetcher Agent Filters
+The `FetcherAgent` leverages the database helper to load the active filters:
+
+```rust
+// Inside FetcherAgentImpl::fetch_and_parse
+let db_helper = DatabaseHelper::from(self.config.get().db)?;
+let active_filters = db_helper.query(
+    "SELECT pattern, filter_type FROM link_filters WHERE is_active = true",
+    &[]
+)?;
+```
+
+The extracted links are matched against these rules (e.g., checking if the host ends with a blacklisted domain, or if the URL contains a blacklisted keyword) before being returned in `FetchResult`.
+
+---
+
+## Relative Link Resolution Strategy
+
+To support relative URLs inside fetched documents, `FetcherAgent` resolves links during the content extraction phase:
+
+1. **HTML Base Tag Support**: The agent checks for the presence of a `<base href="...">` tag using a case-insensitive regular expression:
+   ```regex
+   (?i)<base\s+[^>]*href\s*=\s*["']([^"']+)["']
+   ```
+2. **Resolution Fallback**:
+   - If a `<base>` tag with a valid absolute URL is found, it is used as the base URL for resolving all relative links on that page.
+   - If no `<base>` tag is present, the page's original fetching URL is used as the base.
+3. **Rust URL crate integration**: The resolving engine calls `base_url.join(relative_link)` which natively handles root-relative (`/path`), path-relative (`path/to/resource`), parent-relative (`../path`), and protocol-relative (`//domain/path`) links.
+
+
