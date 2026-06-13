@@ -34,7 +34,8 @@ secretDefaults:
     urlProcessing:
       boostWords: ["/docs/", "/blog/", "/wiki/", "/article/"]
       maxUrlLength: 200
-      allowCrossDomain: false
+      crossDomainPolicy: "SubdomainsOnly"
+      normalizePrefixes: ["www"]
 httpApi:
   deployments:
     local:

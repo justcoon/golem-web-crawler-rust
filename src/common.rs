@@ -71,3 +71,38 @@ crate::db_row_decoder!(LinkFilter {
     is_active,
     created_at,
 });
+
+pub fn normalize_domain(domain: &str, normalize_prefixes: &[String]) -> String {
+    let domain_lower = domain.to_lowercase();
+    for prefix in normalize_prefixes {
+        let prefix_dot = format!("{}.", prefix.to_lowercase());
+        if domain_lower.starts_with(&prefix_dot) {
+            return domain_lower[prefix_dot.len()..].to_string();
+        }
+    }
+    domain_lower
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_domain() {
+        let prefixes = vec!["www".to_string(), "m".to_string(), "mobile".to_string()];
+        assert_eq!(
+            normalize_domain("www.golem.cloud", &prefixes),
+            "golem.cloud"
+        );
+        assert_eq!(normalize_domain("m.golem.cloud", &prefixes), "golem.cloud");
+        assert_eq!(
+            normalize_domain("mobile.golem.cloud", &prefixes),
+            "golem.cloud"
+        );
+        assert_eq!(
+            normalize_domain("learn.golem.cloud", &prefixes),
+            "learn.golem.cloud"
+        );
+        assert_eq!(normalize_domain("golem.cloud", &prefixes), "golem.cloud");
+    }
+}
