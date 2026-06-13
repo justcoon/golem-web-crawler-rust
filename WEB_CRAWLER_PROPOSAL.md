@@ -167,6 +167,8 @@ secretDefaults:
 These changes enable each agent to obtain its own database credentials and simplify testing and deployment across environments.
 
 ---
+
+### 1. `src/orchestrator.rs`
 Contains `OrchestratorAgent` and its error types.
 
 ```rust
@@ -174,10 +176,27 @@ use golem_rust::{agent_definition, endpoint, Schema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub enum FilterType {
+    DomainBlacklist,
+    UrlRegex,
+    Keyword,
+    Extension,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
+pub struct LinkFilter {
+    pub id: i32,
+    pub pattern: String,
+    pub filter_type: FilterType,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum OrchestratorError {
     EmptySeedList,
     InvalidUrl { url: String },
-    DatabaseError { message: String },
+    DbError { message: String },
 }
 
 #[agent_definition(ephemeral, mount = "/crawler")]
@@ -191,6 +210,18 @@ pub trait OrchestratorAgent {
     // Get all unique crawled domains from database
     #[endpoint(get = "/domains")]
     async fn get_domains(&self) -> Result<Vec<String>, OrchestratorError>;
+
+    // Add a link filter pattern to exclude from crawls
+    #[endpoint(post = "/filters")]
+    async fn add_filter(&self, pattern: String, filter_type: FilterType) -> Result<(), OrchestratorError>;
+
+    // Get list of all link filters
+    #[endpoint(get = "/filters")]
+    async fn get_filters(&self) -> Result<Vec<LinkFilter>, OrchestratorError>;
+
+    // Remove a link filter pattern by ID
+    #[endpoint(delete = "/filters/{id}")]
+    async fn delete_filter(&self, id: i32) -> Result<(), OrchestratorError>;
 }
 ```
 
@@ -263,7 +294,7 @@ pub enum FetcherError {
     InvalidUrl { url: String, reason: String },
     RobotsDisallowed { url: String },
     HttpFetchFailed { url: String, status_code: u16, message: String },
-    PostgresWriteFailed { message: String },
+    DbError { message: String },
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -323,4 +354,59 @@ To ensure memory remains bounded even when crawling millions of pages:
 6. **Deduplicate**: `DomainCrawlerAgent` queries PostgreSQL to filter out already-processed URLs.
 7. **Queue**: The remaining new prioritized URLs are sorted into their respective `PriorityBucket` queues in `queues` depending on their priority values, and sorted by priority to keep them ordered.
 8. **Querying**: Users call `SearchAgent` which runs standard full-text indexing queries over the database contents.
+
+---
+
+## URL and Content Filtering Strategy (Ads, Spam, Social Networks)
+
+To maintain crawl quality and prevent storing irrelevant link graphs, the system filters out advertisements, spam, tracker scripts, and social network links.
+
+### 1. Where Filtering is Applied
+
+Filtering is applied entirely during content extraction within the **`FetcherAgent`** itself.
+
+```mermaid
+flowchart TD
+    HTML[Raw HTML] --> Fetcher[FetcherAgent: fetch_and_parse]
+    DB[(PostgreSQL)] -->|Query active link_filters| Fetcher
+    Fetcher -->|Filter links during extraction| CleanLinks[Clean Extracted Links]
+    CleanLinks -->|Return via RPC| Domain[DomainCrawlerAgent]
+```
+
+* **Why**: Minimizes the size of the RPC response payload sent back to the `DomainCrawlerAgent` and reduces serialization/network overhead.
+* **How it works**: Before parsing the fetched HTML, `FetcherAgent` queries active filter rules from the database `link_filters` table and drops any matching URLs during link extraction.
+
+---
+
+### 2. Database Schema for Dynamic Filtering
+
+To support runtime updates to the blacklist without agent redeployments, we introduce a `link_filters` table in the database:
+
+```sql
+CREATE TABLE link_filters (
+    id SERIAL PRIMARY KEY,
+    pattern TEXT NOT NULL UNIQUE,       -- E.g., 'doubleclick.net', 'google-analytics.com', 'facebook.com'
+    filter_type VARCHAR(50) NOT NULL,   -- 'domain_blacklist', 'url_regex', 'keyword'
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Initial seed data is populated via migration scripts containing standard social network domains, popular ad-servers, and tracking patterns.
+
+### 3. Agent Configuration & Code Strategy
+
+#### Fetcher Agent Filters
+The `FetcherAgent` leverages the database helper to load the active filters:
+
+```rust
+// Inside FetcherAgentImpl::fetch_and_parse
+let db_helper = DatabaseHelper::from(self.config.get().db)?;
+let active_filters = db_helper.query(
+    "SELECT pattern, filter_type FROM link_filters WHERE is_active = true",
+    &[]
+)?;
+```
+
+The extracted links are matched against these rules (e.g., checking if the host ends with a blacklisted domain, or if the URL contains a blacklisted keyword) before being returned in `FetchResult`.
 

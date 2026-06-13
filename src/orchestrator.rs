@@ -1,6 +1,7 @@
-use crate::common::{PrioritizedUrl, get_domain_from_url};
+use crate::common::PrioritizedUrl;
 use crate::common_lib::database::{DatabaseHelper, PostgresDbConfig, Single};
 use crate::domain_crawler::DomainCrawlerAgentClient;
+use crate::encode_params;
 use golem_rust::{
     ConfigSchema, Schema, agent_definition, agent_implementation, agentic::Config, endpoint,
 };
@@ -12,11 +13,13 @@ pub struct OrchestratorConfig {
     pub db: PostgresDbConfig,
 }
 
+use crate::common::{FilterType, LinkFilter};
+
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum OrchestratorError {
     EmptySeedList,
     InvalidUrl { url: String },
-    DatabaseError { message: String },
+    DbError { message: String },
 }
 
 #[agent_definition(ephemeral, mount = "/crawler")]
@@ -28,6 +31,19 @@ pub trait OrchestratorAgent {
 
     #[endpoint(get = "/domains")]
     async fn get_domains(&self) -> Result<Vec<String>, OrchestratorError>;
+
+    #[endpoint(post = "/filters")]
+    async fn add_filter(
+        &self,
+        pattern: String,
+        filter_type: FilterType,
+    ) -> Result<(), OrchestratorError>;
+
+    #[endpoint(get = "/filters")]
+    async fn get_filters(&self) -> Result<Vec<LinkFilter>, OrchestratorError>;
+
+    #[endpoint(delete = "/filters/{id}")]
+    async fn delete_filter(&self, id: i32) -> Result<(), OrchestratorError>;
 }
 
 pub struct OrchestratorAgentImpl {
@@ -49,12 +65,15 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
         let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
             std::collections::HashMap::new();
         for url in seeds {
-            if let Some(domain) = get_domain_from_url(&url) {
-                if let Ok(parsed_url) = url::Url::parse(&url) {
-                    grouped.entry(domain).or_default().push(PrioritizedUrl {
-                        url: parsed_url,
-                        priority: 10, // Default seed priority
-                    });
+            if let Ok(parsed_url) = url::Url::parse(&url) {
+                if let Some(domain) = parsed_url.host_str() {
+                    grouped
+                        .entry(domain.to_string())
+                        .or_default()
+                        .push(PrioritizedUrl {
+                            url: parsed_url,
+                            priority: 10, // Default seed priority
+                        });
                 } else {
                     return Err(OrchestratorError::InvalidUrl { url });
                 }
@@ -74,10 +93,9 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
 
     async fn get_domains(&self) -> Result<Vec<String>, OrchestratorError> {
         let db_cfg = self.config.get().db;
-        let db_helper =
-            DatabaseHelper::from(db_cfg).map_err(|e| OrchestratorError::DatabaseError {
-                message: format!("Failed to connect to database: {:?}", e),
-            })?;
+        let db_helper = DatabaseHelper::from(db_cfg).map_err(|e| OrchestratorError::DbError {
+            message: format!("Failed to connect to database: {:?}", e),
+        })?;
 
         let rows: Vec<Single<String>> = db_helper
             .transactional(|tx| {
@@ -86,10 +104,74 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
                 use crate::common_lib::database::DbResultDecoder;
                 Single::<String>::decode_result(res)
             })
-            .map_err(|e| OrchestratorError::DatabaseError {
+            .map_err(|e| OrchestratorError::DbError {
                 message: format!("Failed to query domains: {:?}", e),
             })?;
 
         Ok(rows.into_iter().map(|s| s.0).collect())
+    }
+
+    async fn add_filter(
+        &self,
+        pattern: String,
+        filter_type: FilterType,
+    ) -> Result<(), OrchestratorError> {
+        let db_cfg = self.config.get().db;
+        let db_helper = DatabaseHelper::from(db_cfg).map_err(|e| OrchestratorError::DbError {
+            message: format!("Failed to connect to database: {:?}", e),
+        })?;
+
+        db_helper
+            .transactional(|tx| {
+                let sql = "INSERT INTO link_filters (pattern, filter_type) VALUES ($1, $2) \
+                           ON CONFLICT (pattern) DO UPDATE SET filter_type = EXCLUDED.filter_type, is_active = true";
+                tx.execute(sql, encode_params!(&pattern, filter_type))?;
+                Ok(())
+            })
+            .map_err(|e| OrchestratorError::DbError {
+                message: format!("Failed to add link filter: {:?}", e),
+            })?;
+
+        Ok(())
+    }
+
+    async fn get_filters(&self) -> Result<Vec<LinkFilter>, OrchestratorError> {
+        let db_cfg = self.config.get().db;
+        let db_helper = DatabaseHelper::from(db_cfg).map_err(|e| OrchestratorError::DbError {
+            message: format!("Failed to connect to database: {:?}", e),
+        })?;
+
+        let rows = db_helper
+            .transactional(|tx| {
+                let sql = "SELECT id, pattern, filter_type, is_active, created_at::TEXT AS created_at \
+                           FROM link_filters ORDER BY id DESC";
+                let res = tx.query(sql, vec![])?;
+                use crate::common_lib::database::DbResultDecoder;
+                LinkFilter::decode_result(res)
+            })
+            .map_err(|e| OrchestratorError::DbError {
+                message: format!("Failed to query link filters: {:?}", e),
+            })?;
+
+        Ok(rows)
+    }
+
+    async fn delete_filter(&self, id: i32) -> Result<(), OrchestratorError> {
+        let db_cfg = self.config.get().db;
+        let db_helper = DatabaseHelper::from(db_cfg).map_err(|e| OrchestratorError::DbError {
+            message: format!("Failed to connect to database: {:?}", e),
+        })?;
+
+        db_helper
+            .transactional(|tx| {
+                let sql = "DELETE FROM link_filters WHERE id = $1";
+                tx.execute(sql, encode_params!(&id))?;
+                Ok(())
+            })
+            .map_err(|e| OrchestratorError::DbError {
+                message: format!("Failed to delete link filter: {:?}", e),
+            })?;
+
+        Ok(())
     }
 }

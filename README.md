@@ -43,6 +43,7 @@ The application implements four specialized Golem Agents:
   * Groups a list of seed URLs by their root domains.
   * Spawns or notifies the respective `DomainCrawlerAgent` for each unique domain.
   * Queries database for a list of crawled domains.
+  * Provides API endpoints to manage link filters (add, list, and delete filtering rules).
 
 ### 2. DomainCrawlerAgent (Durable, State-Managed)
 * **Mount Path**: `/domains/{domain}`
@@ -59,6 +60,7 @@ The application implements four specialized Golem Agents:
   * Spanned on-demand per page request.
   * Fetches raw HTML content using async I/O.
   * Extracts page title and links.
+  * Loads and applies active link filters (such as domain blacklists, regex matches, keywords, and static file extensions) from the database during link extraction to ignore ads, spam, and social networks.
   * Saves page content, HTTP status, parsed text, and metadata to PostgreSQL.
 
 ### 4. SearchAgent (Ephemeral)

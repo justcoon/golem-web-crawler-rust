@@ -37,7 +37,7 @@ pub enum FetcherError {
         status_code: u16,
         message: String,
     },
-    PostgresWriteFailed {
+    DbError {
         message: String,
     },
 }
@@ -64,14 +64,30 @@ impl FetcherAgent for FetcherAgentImpl {
         // Perform HTTP GET and extract body using helper
         let (status, body) = fetch_body(&url_str).await?;
 
-        // Extract title and links using helper
-        let (title, extracted_links) = extract_content(&url, &body);
-
-        // Persist result to PostgreSQL (ignore errors for now)
         let cfg = self.config.get();
-        if let Ok(db_helper) = DatabaseHelper::from(cfg.db) {
-            let domain = url.host_str().unwrap_or_default().to_string();
-            let _ = db_helper.transactional(|tx| {
+        let db_helper = DatabaseHelper::from(cfg.db).map_err(|e| FetcherError::DbError {
+            message: format!("Failed to connect to database: {:?}", e),
+        })?;
+
+        // Retrieve active filters
+        let active_filters = db_helper
+            .transactional(|tx| {
+                let sql = "SELECT pattern, filter_type FROM link_filters WHERE is_active = true";
+                let res = tx.query(sql, vec![])?;
+                use crate::common_lib::database::DbResultDecoder;
+                <(String, crate::common::FilterType)>::decode_result(res)
+            })
+            .map_err(|e| FetcherError::DbError {
+                message: format!("Failed to load link filters: {:?}", e),
+            })?;
+
+        // Extract title and links using helper
+        let (title, extracted_links) = extract_content(&url, &body, &active_filters);
+
+        // Persist result to PostgreSQL
+        let domain = url.host_str().unwrap_or_default().to_string();
+        db_helper
+            .transactional(|tx| {
                 let sql = "INSERT INTO page_contents (url, domain, title, http_status, raw_html, extracted_text) \
                            VALUES ($1, $2, $3, $4, $5, $6) \
                            ON CONFLICT (url) DO UPDATE SET \
@@ -83,8 +99,10 @@ impl FetcherAgent for FetcherAgentImpl {
                            saved_at = CURRENT_TIMESTAMP";
                 tx.execute(sql, encode_params!(&url_str, &domain, &title, &(status as i32), &body, &body))?;
                 Ok(())
-            });
-        }
+            })
+            .map_err(|e| FetcherError::DbError {
+                message: format!("Failed to write page contents: {:?}", e),
+            })?;
 
         Ok(FetchResult {
             url,
@@ -129,28 +147,128 @@ fn resolve_url(base_url: &url::Url, relative: &str) -> Option<url::Url> {
     base_url.join(relative).ok()
 }
 
-fn extract_content(base_url: &url::Url, body: &str) -> (String, Vec<url::Url>) {
-    // Extract title using regex
-    let title_regex = Regex::new(r"<title>(?P<title>.*?)</title>").unwrap();
+fn is_filtered(url: &url::Url, filters: &[(String, crate::common::FilterType)]) -> bool {
+    let url_str = url.to_string();
+    let host = url.host_str().unwrap_or_default().to_lowercase();
+    let path = url.path().to_lowercase();
+
+    for (pattern, filter_type) in filters {
+        let pattern_lower = pattern.to_lowercase();
+        match filter_type {
+            crate::common::FilterType::DomainBlacklist => {
+                if host == pattern_lower || host.ends_with(&format!(".{}", pattern_lower)) {
+                    return true;
+                }
+            }
+            crate::common::FilterType::Keyword => {
+                if url_str.to_lowercase().contains(&pattern_lower) {
+                    return true;
+                }
+            }
+            crate::common::FilterType::UrlRegex => {
+                if let Ok(re) = Regex::new(pattern) {
+                    if re.is_match(&url_str) {
+                        return true;
+                    }
+                }
+            }
+            crate::common::FilterType::Extension => {
+                if path.ends_with(&pattern_lower) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn extract_content(
+    base_url: &url::Url,
+    body: &str,
+    active_filters: &[(String, crate::common::FilterType)],
+) -> (String, Vec<url::Url>) {
+    // Extract title using regex (case-insensitive)
+    let title_regex = Regex::new(r"(?i)<title>(?P<title>.*?)</title>").unwrap();
     let title = title_regex
         .captures(body)
         .and_then(|c| c.name("title"))
-        .map(|m| m.as_str().to_string())
+        .map(|m| m.as_str().trim().to_string())
         .unwrap_or_default();
 
-    // Simple link extraction (href attributes)
-    let link_regex = Regex::new(r#"href\s*=\s*[\"']([^\"']+)[\"']"#).unwrap();
+    // Regex matching href attributes inside anchor (<a>) tags specifically
+    let link_regex = Regex::new(r#"(?i)<a\s+[^>]*href\s*=\s*["']([^"']+)["']"#).unwrap();
     let mut extracted_links = Vec::new();
     for cap in link_regex.captures_iter(body) {
         if let Some(m) = cap.get(1) {
-            let link = m.as_str().to_string();
+            let link = m.as_str().trim().to_string();
             if !link.is_empty()
+                && !link.starts_with('#')
                 && !link.starts_with("javascript:")
+                && !link.starts_with("mailto:")
+                && !link.starts_with("tel:")
                 && let Some(resolved) = resolve_url(base_url, &link)
             {
-                extracted_links.push(resolved);
+                let scheme = resolved.scheme();
+                if (scheme == "http" || scheme == "https")
+                    && !is_filtered(&resolved, active_filters)
+                {
+                    extracted_links.push(resolved);
+                }
             }
         }
     }
     (title, extracted_links)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    #[test]
+    fn test_extract_content_filters() {
+        let base_url = Url::parse("https://example.com/page").unwrap();
+        let body = r##"
+            <html>
+            <head>
+                <title>Test Page</title>
+                <link rel="stylesheet" href="/assets/style.css">
+                <link rel="icon" href="https://example.com/favicon.ico">
+            </head>
+            <body>
+                <a href="/about">About Us</a>
+                <a href="https://other.com/contact.html">Contact</a>
+                <a href="javascript:void(0)">JS Link</a>
+                <a href="#section">Fragment Link</a>
+                <a href="mailto:info@example.com">Email Us</a>
+                <a href="/downloads/report.pdf">Download PDF</a>
+                <a href="/static/react.bundle.js">JS Library</a>
+                <img src="/img/logo.png" href="/img/logo.png">
+                <a href="https://facebook.com/someprofile">Facebook Profile</a>
+                <a href="https://other.com/page?utm_campaign=xyz">Campaign Link</a>
+            </body>
+            </html>
+        "##;
+
+        let active_filters = vec![
+            (
+                "facebook.com".to_string(),
+                crate::common::FilterType::DomainBlacklist,
+            ),
+            ("utm_".to_string(), crate::common::FilterType::Keyword),
+            (".css".to_string(), crate::common::FilterType::Extension),
+            (".ico".to_string(), crate::common::FilterType::Extension),
+            (".pdf".to_string(), crate::common::FilterType::Extension),
+            (".js".to_string(), crate::common::FilterType::Extension),
+        ];
+
+        let (title, links) = extract_content(&base_url, body, &active_filters);
+        assert_eq!(title, "Test Page");
+
+        let expected_links: Vec<Url> = vec![
+            Url::parse("https://example.com/about").unwrap(),
+            Url::parse("https://other.com/contact.html").unwrap(),
+        ];
+        assert_eq!(links, expected_links);
+    }
 }

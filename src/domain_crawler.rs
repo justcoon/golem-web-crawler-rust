@@ -1,5 +1,5 @@
 // src/domain_crawler.rs
-use crate::common::{PrioritizedUrl, get_domain_from_url};
+use crate::common::PrioritizedUrl;
 use crate::common_lib::database::{DatabaseHelper, PostgresDbConfig, Single};
 use crate::fetcher::FetcherAgentClient;
 use golem_rust::agentic::{Config, Secret};
@@ -269,9 +269,7 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 
             // Start processing if inactive and we have items
             if self.state.is_inactive() && self.state.has_pending() {
-                self.state.set_status(ProcessingStatus::Scheduled);
-                let mut client = DomainCrawlerAgentClient::get(self.state.domain.clone());
-                client.trigger_process_next();
+                self.schedule_next_step();
             }
 
             Ok(())
@@ -348,7 +346,7 @@ impl DomainCrawlerAgentImpl {
             if link_str.len() as u32 > max_url_len {
                 continue;
             }
-            if let Some(domain) = get_domain_from_url(&link_str)
+            if let Some(domain) = link_url.host_str()
                 && (domain == self.state.domain || allow_cross_domain)
             {
                 candidate_urls.push(link_url);
@@ -368,13 +366,16 @@ impl DomainCrawlerAgentImpl {
         let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
             std::collections::HashMap::new();
         for link_url in uncrawled_urls {
-            let link_str = link_url.to_string();
-            if let Some(domain) = get_domain_from_url(&link_str) {
+            if let Some(domain) = link_url.host_str() {
+                let link_str = link_url.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
-                grouped.entry(domain).or_default().push(PrioritizedUrl {
-                    url: link_url,
-                    priority,
-                });
+                grouped
+                    .entry(domain.to_string())
+                    .or_default()
+                    .push(PrioritizedUrl {
+                        url: link_url,
+                        priority,
+                    });
             }
         }
 

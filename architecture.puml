@@ -40,14 +40,14 @@ gateway --> search : "RPC /mount: /search"
 
 ' Agent Interactions
 orchestrator --> crawler : "Asynchronously triggers\nDomainCrawlerAgent::enqueue"
-orchestrator --> postgres : "Queries crawled domains"
+orchestrator --> postgres : "Queries crawled domains &\nmanages link filters"
 
 crawler --> websites : "Fetches and parses robots.txt"
 crawler --> fetcher : "Spawns & calls fetch_and_parse"
 crawler --> crawler : "Self-schedules next step\nor routes cross-domain URLs"
 
 fetcher --> websites : "Fetches target web pages"
-fetcher --> postgres : "Persists crawled page\ncontent & metadata"
+fetcher --> postgres : "Queries active filters &\npersists crawled page data"
 
 search --> postgres : "Executes English Full-Text Search"
 
