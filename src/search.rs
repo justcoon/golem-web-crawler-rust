@@ -30,7 +30,7 @@ crate::db_row_decoder!(SearchResultPage {
 pub trait SearchAgent {
     fn new(#[agent_config] config: Config<SearchConfig>) -> Self;
 
-    #[endpoint(get = "/")]
+    #[endpoint(get = "/?query={query}")]
     async fn search(&self, query: String) -> Result<Vec<SearchResultPage>, String>;
 }
 

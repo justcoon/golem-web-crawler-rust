@@ -120,6 +120,7 @@ pub struct DomainState {
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>,
     pub rng_state: u32,
+    pub processed_count: u64,
 }
 ```
 
@@ -261,6 +262,7 @@ pub struct DomainState {
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>, // None means not fetched yet
     pub rng_state: u32,
+    pub processed_count: u64,
 }
 
 #[agent_definition(mount = "/domains/{domain_name}")]
@@ -409,4 +411,20 @@ let active_filters = db_helper.query(
 ```
 
 The extracted links are matched against these rules (e.g., checking if the host ends with a blacklisted domain, or if the URL contains a blacklisted keyword) before being returned in `FetchResult`.
+
+---
+
+## Relative Link Resolution Strategy
+
+To support relative URLs inside fetched documents, `FetcherAgent` resolves links during the content extraction phase:
+
+1. **HTML Base Tag Support**: The agent checks for the presence of a `<base href="...">` tag using a case-insensitive regular expression:
+   ```regex
+   (?i)<base\s+[^>]*href\s*=\s*["']([^"']+)["']
+   ```
+2. **Resolution Fallback**:
+   - If a `<base>` tag with a valid absolute URL is found, it is used as the base URL for resolving all relative links on that page.
+   - If no `<base>` tag is present, the page's original fetching URL is used as the base.
+3. **Rust URL crate integration**: The resolving engine calls `base_url.join(relative_link)` which natively handles root-relative (`/path`), path-relative (`path/to/resource`), parent-relative (`../path`), and protocol-relative (`//domain/path`) links.
+
 

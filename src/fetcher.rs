@@ -113,34 +113,80 @@ impl FetcherAgent for FetcherAgentImpl {
     }
 }
 
-// Helper function to fetch body and status
+// Helper function to fetch body and status, following redirects and adding a User-Agent
 async fn fetch_body(url: &str) -> Result<(u16, String), FetcherError> {
-    let request = Request::get(url)
-        .header("Accept", HeaderValue::from_static("text/html"))
-        .body(Body::empty())
-        .expect("Failed to build request");
-    let mut response =
-        Client::new()
-            .send(request)
-            .await
-            .map_err(|e| FetcherError::HttpFetchFailed {
-                url: url.to_string(),
-                status_code: 0,
-                message: format!("{:?}", e),
-            })?;
-    let status = response.status().as_u16();
-    let body_bytes =
-        response
-            .body_mut()
-            .contents()
-            .await
-            .map_err(|e| FetcherError::HttpFetchFailed {
-                url: url.to_string(),
-                status_code: status,
-                message: format!("{:?}", e),
-            })?;
-    let body = String::from_utf8_lossy(body_bytes).to_string();
-    Ok((status, body))
+    let mut current_url = url.to_string();
+    let mut redirect_count = 0;
+    const MAX_REDIRECTS: u8 = 5;
+
+    loop {
+        let request = Request::get(&current_url)
+            .header("Accept", HeaderValue::from_static("text/html"))
+            .header("User-Agent", HeaderValue::from_static("golem-crawler/1.0"))
+            .body(Body::empty())
+            .expect("Failed to build request");
+
+        let mut response =
+            Client::new()
+                .send(request)
+                .await
+                .map_err(|e| FetcherError::HttpFetchFailed {
+                    url: current_url.clone(),
+                    status_code: 0,
+                    message: format!("{:?}", e),
+                })?;
+
+        let status = response.status().as_u16();
+
+        // If it is a redirect, resolve location and follow it
+        if (300..=399).contains(&status) {
+            if redirect_count >= MAX_REDIRECTS {
+                return Err(FetcherError::HttpFetchFailed {
+                    url: current_url.clone(),
+                    status_code: status,
+                    message: "Too many redirects".to_string(),
+                });
+            }
+
+            if let Some(loc_header) = response.headers().get("location") {
+                let loc_str = loc_header
+                    .to_str()
+                    .map_err(|e| FetcherError::HttpFetchFailed {
+                        url: current_url.clone(),
+                        status_code: status,
+                        message: format!("Invalid Location header encoding: {:?}", e),
+                    })?;
+
+                let base = url::Url::parse(&current_url).map_err(|e| FetcherError::InvalidUrl {
+                    url: current_url.clone(),
+                    reason: format!("Failed to parse current URL: {:?}", e),
+                })?;
+
+                let next_url = base.join(loc_str).map_err(|e| FetcherError::InvalidUrl {
+                    url: loc_str.to_string(),
+                    reason: format!("Failed to resolve redirect location: {:?}", e),
+                })?;
+
+                current_url = next_url.to_string();
+                redirect_count += 1;
+                log::info!("Following redirect to: {} (status {})", current_url, status);
+                continue;
+            }
+        }
+
+        let body_bytes =
+            response
+                .body_mut()
+                .contents()
+                .await
+                .map_err(|e| FetcherError::HttpFetchFailed {
+                    url: current_url.clone(),
+                    status_code: status,
+                    message: format!("{:?}", e),
+                })?;
+        let body = String::from_utf8_lossy(body_bytes).to_string();
+        return Ok((status, body));
+    }
 }
 
 fn resolve_url(base_url: &url::Url, relative: &str) -> Option<url::Url> {
@@ -195,6 +241,25 @@ fn extract_content(
         .map(|m| m.as_str().trim().to_string())
         .unwrap_or_default();
 
+    // Check for a <base href="..."> tag in the HTML body to determine resolution context
+    let base_tag_regex = Regex::new(r#"(?i)<base\s+[^>]*href\s*=\s*["']([^"']+)["']"#).unwrap();
+    let resolved_base_url = if let Some(cap) = base_tag_regex.captures(body) {
+        if let Some(m) = cap.get(1) {
+            let base_href = m.as_str().trim();
+            if let Ok(parsed_base) = url::Url::parse(base_href) {
+                parsed_base
+            } else if let Ok(joined_base) = base_url.join(base_href) {
+                joined_base
+            } else {
+                base_url.clone()
+            }
+        } else {
+            base_url.clone()
+        }
+    } else {
+        base_url.clone()
+    };
+
     // Regex matching href attributes inside anchor (<a>) tags specifically
     let link_regex = Regex::new(r#"(?i)<a\s+[^>]*href\s*=\s*["']([^"']+)["']"#).unwrap();
     let mut extracted_links = Vec::new();
@@ -206,7 +271,7 @@ fn extract_content(
                 && !link.starts_with("javascript:")
                 && !link.starts_with("mailto:")
                 && !link.starts_with("tel:")
-                && let Some(resolved) = resolve_url(base_url, &link)
+                && let Some(resolved) = resolve_url(&resolved_base_url, &link)
             {
                 let scheme = resolved.scheme();
                 if (scheme == "http" || scheme == "https")
@@ -268,6 +333,33 @@ mod tests {
         let expected_links: Vec<Url> = vec![
             Url::parse("https://example.com/about").unwrap(),
             Url::parse("https://other.com/contact.html").unwrap(),
+        ];
+        assert_eq!(links, expected_links);
+    }
+
+    #[test]
+    fn test_extract_content_with_base_tag() {
+        let base_url = Url::parse("https://example.com/blog/post1").unwrap();
+        let body = r##"
+            <html>
+            <head>
+                <base href="https://example.com/archive/">
+                <title>Base Tag Test</title>
+            </head>
+            <body>
+                <a href="about">About (relative to archive)</a>
+                <a href="/root">Root-relative</a>
+                <a href="https://external.com">External</a>
+            </body>
+            </html>
+        "##;
+
+        let (title, links) = extract_content(&base_url, body, &[]);
+        assert_eq!(title, "Base Tag Test");
+        let expected_links: Vec<Url> = vec![
+            Url::parse("https://example.com/archive/about").unwrap(),
+            Url::parse("https://example.com/root").unwrap(),
+            Url::parse("https://external.com/").unwrap(),
         ];
         assert_eq!(links, expected_links);
     }

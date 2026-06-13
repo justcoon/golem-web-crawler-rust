@@ -59,6 +59,8 @@ pub struct DomainState {
     pub status: ProcessingStatus,
     pub robots_disallowed: Option<Vec<String>>,
     pub rng_state: u32,
+    pub processed_count: u64,
+    pub error_count: u64,
 }
 
 impl DomainState {
@@ -74,6 +76,8 @@ impl DomainState {
             status: ProcessingStatus::Inactive,
             robots_disallowed: None,
             rng_state: 12345,
+            processed_count: 0,
+            error_count: 0,
         }
     }
 
@@ -312,10 +316,12 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
 
                     match fetch_result {
                         Ok(result) => {
+                            self.state.processed_count += 1;
                             self.process_extracted_links(result.extracted_links).await;
                         }
                         Err(e) => {
                             log::error!("Failed to fetch URL {}: {:?}", target.url, e);
+                            self.state.error_count += 1;
                         }
                     }
 
@@ -540,6 +546,8 @@ mod tests {
         assert_eq!(state.get_delay(), 1000);
         assert!(state.is_inactive());
         assert!(!state.has_pending());
+        assert_eq!(state.processed_count, 0);
+        assert_eq!(state.error_count, 0);
     }
 
     #[test]
