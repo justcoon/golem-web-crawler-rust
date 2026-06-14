@@ -55,6 +55,7 @@ The application implements four specialized Golem Agents:
   * Manages the priority queue of pending URLs for the domain.
   * Spawns and delegates page retrieval tasks to the ephemeral `FetcherAgent`.
   * Self-schedules its next processing loop step via Golem's future-scheduling capabilities.
+  * Filters candidate URLs using a configurable Cache TTL (`cache_ttl_seconds`), allowing automatic re-crawling of stale pages (`Some(ttl)`), complete bypass for forced crawls (`Some(0)`), or permanent caching (`None`).
   * Normalizes domain names (stripping configurable prefixes like `www.`) and routes cross-domain URLs to other target domain agents according to the configured `crossDomainPolicy` (`None`, `SubdomainsOnly`, `Any`).
 
 ### 3. FetcherAgent (Ephemeral)
