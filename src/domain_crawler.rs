@@ -433,31 +433,23 @@ impl DomainCrawlerAgentImpl {
             }
         };
 
-        // 3. Only now calculate priorities and group by domain
-        let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
-            std::collections::HashMap::new();
-        for link_url in uncrawled_urls {
-            if let Some(domain) = link_url.host_str() {
-                let normalized_domain =
-                    crate::common::normalize_domain(domain, &normalize_prefixes);
-                let link_str = link_url.to_string();
+        // 3. Group and prioritize URLs by normalized domain
+        let grouped_by_domain = crate::common::group_prioritized_urls_by_normalized_domain(
+            uncrawled_urls,
+            &normalize_prefixes,
+            |u| {
+                let link_str = u.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
-                grouped
-                    .entry(normalized_domain)
-                    .or_default()
-                    .push(PrioritizedUrl {
-                        url: link_url,
-                        priority,
-                    });
-            }
-        }
+                PrioritizedUrl { url: u, priority }
+            },
+        );
 
-        for (domain, urls) in grouped {
+        for (domain, prioritized_urls) in grouped_by_domain {
             if domain == self.state.domain {
-                self.state.add_urls_allowed_by_robots(urls);
+                self.state.add_urls_allowed_by_robots(prioritized_urls);
             } else {
                 let mut client = DomainCrawlerAgentClient::get(domain);
-                client.trigger_enqueue(urls);
+                client.trigger_enqueue(prioritized_urls);
             }
         }
     }

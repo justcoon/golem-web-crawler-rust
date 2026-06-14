@@ -72,30 +72,28 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
         } else {
             let normalize_prefixes = self.config.get().url_processing.normalize_prefixes.get();
 
-            // Group seed URLs by domain
-            let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
-                std::collections::HashMap::new();
+            // Parse seed URLs
+            let mut parsed_urls = Vec::new();
             for url in seeds {
                 let parsed_url = url::Url::parse(&url)
                     .map_err(|_| OrchestratorError::InvalidUrl { url: url.clone() })?;
-                let domain = parsed_url
-                    .host_str()
-                    .ok_or_else(|| OrchestratorError::InvalidUrl { url: url.clone() })?;
-                let normalized_domain =
-                    crate::common::normalize_domain(domain, &normalize_prefixes);
-                grouped
-                    .entry(normalized_domain)
-                    .or_default()
-                    .push(PrioritizedUrl {
-                        url: parsed_url,
-                        priority: 10, // Default seed priority
-                    });
+                parsed_urls.push(parsed_url);
             }
 
+            // Group and prioritize seed URLs by normalized domain
+            let grouped_by_domain = crate::common::group_prioritized_urls_by_normalized_domain(
+                parsed_urls,
+                &normalize_prefixes,
+                |u| PrioritizedUrl {
+                    url: u,
+                    priority: 10, // Default seed priority
+                },
+            );
+
             // Forward to respective DomainCrawlerAgents asynchronously
-            for (domain, urls) in grouped {
+            for (domain, prioritized_urls) in grouped_by_domain {
                 let mut client = DomainCrawlerAgentClient::get(domain);
-                client.trigger_enqueue(urls);
+                client.trigger_enqueue(prioritized_urls);
             }
 
             Ok(())
