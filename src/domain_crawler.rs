@@ -247,7 +247,7 @@ pub enum DomainCrawlerError {
     FetcherFailed { message: String },
 }
 
-#[agent_definition(mount = "/domains/{domain_name}")]
+#[agent_definition(mount = "/domains/{domain_name}", snapshotting = "every(10)")]
 pub trait DomainCrawlerAgent {
     // Constructor identifies the domain crawler instance.
     fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
@@ -381,6 +381,19 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
             self.state.set_status(ProcessingStatus::Inactive);
         }
         Ok(())
+    }
+
+    async fn load_snapshot(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let state: DomainState = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Failed to deserialize snapshot: {:?}", e))?;
+        self.state = state;
+        Ok(())
+    }
+
+    async fn save_snapshot(&self) -> Result<Vec<u8>, String> {
+        let bytes = serde_json::to_vec(&self.state)
+            .map_err(|e| format!("Failed to serialize snapshot: {:?}", e))?;
+        Ok(bytes)
     }
 }
 
