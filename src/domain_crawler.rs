@@ -42,6 +42,8 @@ pub struct UrlProcessingConfig {
     pub cross_domain_policy: Secret<String>,
     #[config_schema(secret)]
     pub normalize_prefixes: Secret<Vec<String>>,
+    #[config_schema(secret)]
+    pub cache_ttl_seconds: Secret<Option<u64>>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -247,7 +249,7 @@ pub enum DomainCrawlerError {
     FetcherFailed { message: String },
 }
 
-#[agent_definition(mount = "/domains/{domain_name}")]
+#[agent_definition(mount = "/domains/{domain_name}", snapshotting = "every(10)")]
 pub trait DomainCrawlerAgent {
     // Constructor identifies the domain crawler instance.
     fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self;
@@ -382,6 +384,19 @@ impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
         }
         Ok(())
     }
+
+    async fn load_snapshot(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let state: DomainState = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Failed to deserialize snapshot: {:?}", e))?;
+        self.state = state;
+        Ok(())
+    }
+
+    async fn save_snapshot(&self) -> Result<Vec<u8>, String> {
+        let bytes = serde_json::to_vec(&self.state)
+            .map_err(|e| format!("Failed to serialize snapshot: {:?}", e))?;
+        Ok(bytes)
+    }
 }
 
 fn is_subdomain(sub: &str, parent: &str) -> bool {
@@ -425,7 +440,8 @@ impl DomainCrawlerAgentImpl {
         }
 
         // 2. Query DB to filter out already crawled URLs
-        let uncrawled_urls = match filter_uncrawled_urls(db_cfg, candidate_urls).await {
+        let cache_ttl = config.url_processing.cache_ttl_seconds.get();
+        let uncrawled_urls = match filter_uncrawled_urls(db_cfg, candidate_urls, cache_ttl).await {
             Ok(filtered) => filtered,
             Err(e) => {
                 log::error!("Failed to filter uncrawled URLs: {:?}", e);
@@ -433,31 +449,23 @@ impl DomainCrawlerAgentImpl {
             }
         };
 
-        // 3. Only now calculate priorities and group by domain
-        let mut grouped: std::collections::HashMap<String, Vec<PrioritizedUrl>> =
-            std::collections::HashMap::new();
-        for link_url in uncrawled_urls {
-            if let Some(domain) = link_url.host_str() {
-                let normalized_domain =
-                    crate::common::normalize_domain(domain, &normalize_prefixes);
-                let link_str = link_url.to_string();
+        // 3. Group and prioritize URLs by normalized domain
+        let grouped_by_domain = crate::common::group_prioritized_urls_by_normalized_domain(
+            uncrawled_urls,
+            &normalize_prefixes,
+            |u| {
+                let link_str = u.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
-                grouped
-                    .entry(normalized_domain)
-                    .or_default()
-                    .push(PrioritizedUrl {
-                        url: link_url,
-                        priority,
-                    });
-            }
-        }
+                PrioritizedUrl { url: u, priority }
+            },
+        );
 
-        for (domain, urls) in grouped {
+        for (domain, prioritized_urls) in grouped_by_domain {
             if domain == self.state.domain {
-                self.state.add_urls_allowed_by_robots(urls);
+                self.state.add_urls_allowed_by_robots(prioritized_urls);
             } else {
                 let mut client = DomainCrawlerAgentClient::get(domain);
-                client.trigger_enqueue(urls);
+                client.trigger_enqueue(prioritized_urls);
             }
         }
     }
@@ -486,8 +494,12 @@ impl DomainCrawlerAgentImpl {
 async fn filter_uncrawled_urls(
     db_cfg: PostgresDbConfig,
     urls: Vec<url::Url>,
+    cache_ttl_seconds: Option<u64>,
 ) -> Result<Vec<url::Url>, DomainCrawlerError> {
     if urls.is_empty() {
+        Ok(urls)
+    } else if let Some(0) = cache_ttl_seconds {
+        // Force re-crawl everything: no database check or transaction needed
         Ok(urls)
     } else {
         let db_helper =
@@ -499,11 +511,23 @@ async fn filter_uncrawled_urls(
 
         let crawled_urls: std::collections::HashSet<String> = db_helper
             .transactional(|tx| {
-                let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
-                let res = tx.query(sql, crate::encode_params!(&url_strs))?;
-                use crate::common_lib::database::decode::DbResultDecoder;
-                let rows = Single::<String>::decode_result(res)?;
-                Ok(rows.into_iter().map(|s| s.0).collect())
+                match cache_ttl_seconds {
+                    Some(ttl) => {
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1) AND saved_at > CURRENT_TIMESTAMP - ($2 || ' second')::INTERVAL";
+                        let ttl_i64 = ttl as i64;
+                        let res = tx.query(sql, crate::encode_params!(&url_strs, &ttl_i64))?;
+                        use crate::common_lib::database::decode::DbResultDecoder;
+                        let rows = Single::<String>::decode_result(res)?;
+                        Ok(rows.into_iter().map(|s| s.0).collect())
+                    }
+                    None => {
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
+                        let res = tx.query(sql, crate::encode_params!(&url_strs))?;
+                        use crate::common_lib::database::decode::DbResultDecoder;
+                        let rows = Single::<String>::decode_result(res)?;
+                        Ok(rows.into_iter().map(|s| s.0).collect())
+                    }
+                }
             })
             .map_err(|e| DomainCrawlerError::FetcherFailed {
                 message: format!("Failed to query crawled URLs: {:?}", e),

@@ -83,6 +83,37 @@ pub fn normalize_domain(domain: &str, normalize_prefixes: &[String]) -> String {
     domain_lower
 }
 
+pub fn group_urls_by_normalized_domain(
+    urls: Vec<url::Url>,
+    normalize_prefixes: &[String],
+) -> std::collections::HashMap<String, Vec<url::Url>> {
+    let mut grouped = std::collections::HashMap::new();
+    for url in urls {
+        if let Some(host) = url.host_str() {
+            let normalized = normalize_domain(host, normalize_prefixes);
+            grouped.entry(normalized).or_insert_with(Vec::new).push(url);
+        }
+    }
+    grouped
+}
+
+pub fn group_prioritized_urls_by_normalized_domain<F>(
+    urls: Vec<url::Url>,
+    normalize_prefixes: &[String],
+    prioritize: F,
+) -> std::collections::HashMap<String, Vec<PrioritizedUrl>>
+where
+    F: Fn(url::Url) -> PrioritizedUrl,
+{
+    let grouped_urls = group_urls_by_normalized_domain(urls, normalize_prefixes);
+    let mut grouped = std::collections::HashMap::new();
+    for (domain, urls) in grouped_urls {
+        let prioritized = urls.into_iter().map(|u| prioritize(u)).collect();
+        grouped.insert(domain, prioritized);
+    }
+    grouped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +135,40 @@ mod tests {
             "learn.golem.cloud"
         );
         assert_eq!(normalize_domain("golem.cloud", &prefixes), "golem.cloud");
+    }
+
+    #[test]
+    fn test_group_urls_by_normalized_domain() {
+        let prefixes = vec!["www".to_string(), "m".to_string()];
+        let urls = vec![
+            url::Url::parse("https://www.golem.cloud/docs").unwrap(),
+            url::Url::parse("https://golem.cloud/blog").unwrap(),
+            url::Url::parse("https://m.example.com/index").unwrap(),
+            url::Url::parse("https://example.com/about").unwrap(),
+        ];
+        let grouped = group_urls_by_normalized_domain(urls, &prefixes);
+        assert_eq!(grouped.get("golem.cloud").unwrap().len(), 2);
+        assert_eq!(grouped.get("example.com").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_group_prioritized_urls_by_normalized_domain() {
+        let prefixes = vec!["www".to_string(), "m".to_string()];
+        let urls = vec![
+            url::Url::parse("https://www.golem.cloud/docs").unwrap(),
+            url::Url::parse("https://example.com/about").unwrap(),
+        ];
+        let grouped = group_prioritized_urls_by_normalized_domain(urls, &prefixes, |u| {
+            let priority = if u.path().contains("docs") { 20 } else { 5 };
+            PrioritizedUrl { url: u, priority }
+        });
+
+        let golem_urls = grouped.get("golem.cloud").unwrap();
+        assert_eq!(golem_urls.len(), 1);
+        assert_eq!(golem_urls[0].priority, 20);
+
+        let example_urls = grouped.get("example.com").unwrap();
+        assert_eq!(example_urls.len(), 1);
+        assert_eq!(example_urls[0].priority, 5);
     }
 }
