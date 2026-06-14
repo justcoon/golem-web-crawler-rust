@@ -36,6 +36,7 @@ secretDefaults:
       maxUrlLength: 200
       crossDomainPolicy: "SubdomainsOnly"
       normalizePrefixes: ["www"]
+      cacheTtlSeconds: 86400
 
 retryPolicyDefaults:
   local:

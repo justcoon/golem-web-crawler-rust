@@ -42,6 +42,8 @@ pub struct UrlProcessingConfig {
     pub cross_domain_policy: Secret<String>,
     #[config_schema(secret)]
     pub normalize_prefixes: Secret<Vec<String>>,
+    #[config_schema(secret)]
+    pub cache_ttl_seconds: Secret<Option<u64>>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -438,7 +440,8 @@ impl DomainCrawlerAgentImpl {
         }
 
         // 2. Query DB to filter out already crawled URLs
-        let uncrawled_urls = match filter_uncrawled_urls(db_cfg, candidate_urls).await {
+        let cache_ttl = config.url_processing.cache_ttl_seconds.get();
+        let uncrawled_urls = match filter_uncrawled_urls(db_cfg, candidate_urls, cache_ttl).await {
             Ok(filtered) => filtered,
             Err(e) => {
                 log::error!("Failed to filter uncrawled URLs: {:?}", e);
@@ -491,8 +494,12 @@ impl DomainCrawlerAgentImpl {
 async fn filter_uncrawled_urls(
     db_cfg: PostgresDbConfig,
     urls: Vec<url::Url>,
+    cache_ttl_seconds: Option<u64>,
 ) -> Result<Vec<url::Url>, DomainCrawlerError> {
     if urls.is_empty() {
+        Ok(urls)
+    } else if let Some(0) = cache_ttl_seconds {
+        // Force re-crawl everything: no database check or transaction needed
         Ok(urls)
     } else {
         let db_helper =
@@ -504,11 +511,23 @@ async fn filter_uncrawled_urls(
 
         let crawled_urls: std::collections::HashSet<String> = db_helper
             .transactional(|tx| {
-                let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
-                let res = tx.query(sql, crate::encode_params!(&url_strs))?;
-                use crate::common_lib::database::decode::DbResultDecoder;
-                let rows = Single::<String>::decode_result(res)?;
-                Ok(rows.into_iter().map(|s| s.0).collect())
+                match cache_ttl_seconds {
+                    Some(ttl) => {
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1) AND saved_at > CURRENT_TIMESTAMP - ($2 || ' second')::INTERVAL";
+                        let ttl_i64 = ttl as i64;
+                        let res = tx.query(sql, crate::encode_params!(&url_strs, &ttl_i64))?;
+                        use crate::common_lib::database::decode::DbResultDecoder;
+                        let rows = Single::<String>::decode_result(res)?;
+                        Ok(rows.into_iter().map(|s| s.0).collect())
+                    }
+                    None => {
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
+                        let res = tx.query(sql, crate::encode_params!(&url_strs))?;
+                        use crate::common_lib::database::decode::DbResultDecoder;
+                        let rows = Single::<String>::decode_result(res)?;
+                        Ok(rows.into_iter().map(|s| s.0).collect())
+                    }
+                }
             })
             .map_err(|e| DomainCrawlerError::FetcherFailed {
                 message: format!("Failed to query crawled URLs: {:?}", e),
