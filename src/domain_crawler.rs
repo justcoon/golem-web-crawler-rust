@@ -22,17 +22,17 @@ pub enum CrossDomainPolicy {
     Any,
 }
 
-impl CrossDomainPolicy {
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for CrossDomainPolicy {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "subdomainsonly" | "subdomains_only" => CrossDomainPolicy::SubdomainsOnly,
-            "any" => CrossDomainPolicy::Any,
-            _ => CrossDomainPolicy::None,
+            "subdomainsonly" | "subdomains_only" => Ok(CrossDomainPolicy::SubdomainsOnly),
+            "any" => Ok(CrossDomainPolicy::Any),
+            _ => Ok(CrossDomainPolicy::None),
         }
     }
 }
-
-
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub enum ProcessingStatus {
@@ -175,10 +175,10 @@ impl DomainState {
         };
 
         for bucket in queue_order {
-            if let Some(q) = self.queues.get_mut(&bucket) {
-                if !q.is_empty() {
-                    return q.pop();
-                }
+            if let Some(q) = self.queues.get_mut(&bucket)
+                && !q.is_empty()
+            {
+                return q.pop();
             }
         }
 
@@ -398,7 +398,7 @@ impl DomainCrawlerAgentImpl {
 
         let current_policy = self.state.cross_domain_policy.clone().unwrap_or_else(|| {
             let config_policy_str = config.url_processing.cross_domain_policy.get();
-            CrossDomainPolicy::from_str(&config_policy_str)
+            config_policy_str.parse().unwrap_or(CrossDomainPolicy::None)
         });
 
         // 1. Filter out URLs exceeding max length or domain constraints first
@@ -431,14 +431,12 @@ impl DomainCrawlerAgentImpl {
         };
 
         // 3. Group and prioritize URLs by domain
-        let grouped_by_domain = crate::common::group_prioritized_urls_by_domain(
-            uncrawled_urls,
-            |u| {
+        let grouped_by_domain =
+            crate::common::group_prioritized_urls_by_domain(uncrawled_urls, |u| {
                 let link_str = u.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
                 PrioritizedUrl { url: u, priority }
-            },
-        );
+            });
 
         for (domain, prioritized_urls) in grouped_by_domain {
             if domain == self.state.domain {
@@ -564,10 +562,10 @@ fn parse_robots_txt(content: &str) -> (Vec<String>, Option<u32>) {
                 if !val.is_empty() {
                     disallowed.push(val.to_string());
                 }
-            } else if key == "crawl-delay" {
-                if let Ok(secs) = val.parse::<f64>() {
-                    crawl_delay = Some((secs * 1000.0) as u32);
-                }
+            } else if key == "crawl-delay"
+                && let Ok(secs) = val.parse::<f64>()
+            {
+                crawl_delay = Some((secs * 1000.0) as u32);
             }
         }
     }

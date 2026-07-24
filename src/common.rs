@@ -134,7 +134,7 @@ where
     let grouped_urls = group_urls_by_domain(urls);
     let mut grouped = std::collections::HashMap::new();
     for (domain, urls) in grouped_urls {
-        let prioritized = urls.into_iter().map(|u| prioritize(u)).collect();
+        let prioritized = urls.into_iter().map(&prioritize).collect();
         grouped.insert(domain, prioritized);
     }
     grouped

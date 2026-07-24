@@ -238,10 +238,10 @@ fn is_filtered(url: &url::Url, filters: &[(String, crate::common::FilterType)]) 
                 }
             }
             crate::common::FilterType::UrlRegex => {
-                if let Ok(re) = Regex::new(pattern) {
-                    if re.is_match(&url_str) {
-                        return true;
-                    }
+                if let Ok(re) = Regex::new(pattern)
+                    && re.is_match(&url_str)
+                {
+                    return true;
                 }
             }
             crate::common::FilterType::Extension => {

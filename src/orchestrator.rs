@@ -79,13 +79,11 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
             }
 
             // Group and prioritize seed URLs by domain
-            let grouped_by_domain = crate::common::group_prioritized_urls_by_domain(
-                parsed_urls,
-                |u| PrioritizedUrl {
+            let grouped_by_domain =
+                crate::common::group_prioritized_urls_by_domain(parsed_urls, |u| PrioritizedUrl {
                     url: u,
                     priority: 10, // Default seed priority
-                },
-            );
+                });
 
             // Forward to respective DomainCrawlerAgents asynchronously
             for (domain, prioritized_urls) in grouped_by_domain {

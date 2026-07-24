@@ -13,7 +13,7 @@ app: golem-web-crawler-rust
 environments:
   local:
     server: local
-    componentPresets: debug
+    componentPresets: release
   cloud:
     server: cloud
     componentPresets: release
