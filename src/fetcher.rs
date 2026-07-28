@@ -1,3 +1,4 @@
+use crate::common::UrlProcessingConfig;
 use crate::common_lib::database::DatabaseHelper;
 use crate::common_lib::database::PostgresDbConfig;
 use crate::encode_params;
@@ -12,6 +13,8 @@ use wstd::http::{Body, Client, HeaderValue, Request};
 pub struct FetcherConfig {
     #[config_schema(nested)]
     pub db: PostgresDbConfig,
+    #[config_schema(nested)]
+    pub url_processing: UrlProcessingConfig,
 }
 
 // Result of a fetch operation.
@@ -66,6 +69,8 @@ impl FetcherAgent for FetcherAgentImpl {
         let (status, body, final_url) = fetch_body(&url_str).await?;
 
         let cfg = self.config.get();
+        let normalize_prefixes = cfg.url_processing.normalize_prefixes.get();
+        let final_url = crate::common::normalize_url_domain(&final_url, &normalize_prefixes);
         let db_helper = DatabaseHelper::from(cfg.db).map_err(|e| FetcherError::DbError {
             message: format!("Failed to connect to database: {:?}", e),
         })?;
@@ -84,6 +89,12 @@ impl FetcherAgent for FetcherAgentImpl {
 
         // Extract title and links using helper (resolved relative to final redirected URL)
         let (title, extracted_links) = extract_content(&final_url, &body, &active_filters);
+
+        // Normalize domain of extracted URLs as a separate step after extraction
+        let extracted_links = extracted_links
+            .iter()
+            .map(|u| crate::common::normalize_url_domain(u, &normalize_prefixes))
+            .collect();
 
         // Persist result to PostgreSQL
         let final_url_str = final_url.to_string();
@@ -227,10 +238,10 @@ fn is_filtered(url: &url::Url, filters: &[(String, crate::common::FilterType)]) 
                 }
             }
             crate::common::FilterType::UrlRegex => {
-                if let Ok(re) = Regex::new(pattern) {
-                    if re.is_match(&url_str) {
-                        return true;
-                    }
+                if let Ok(re) = Regex::new(pattern)
+                    && re.is_match(&url_str)
+                {
+                    return true;
                 }
             }
             crate::common::FilterType::Extension => {

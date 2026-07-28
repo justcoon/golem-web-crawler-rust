@@ -1,8 +1,8 @@
 // src/domain_crawler.rs
-use crate::common::PrioritizedUrl;
+use crate::common::{PrioritizedUrl, UrlProcessingConfig};
 use crate::common_lib::database::{DatabaseHelper, PostgresDbConfig, Single};
 use crate::fetcher::FetcherAgentClient;
-use golem_rust::agentic::{Config, Secret};
+use golem_rust::agentic::Config;
 use golem_rust::wasip2::clocks::wall_clock::Datetime;
 use golem_rust::{ConfigSchema, Schema, agent_definition, agent_implementation, endpoint};
 use serde::{Deserialize, Serialize};
@@ -22,28 +22,16 @@ pub enum CrossDomainPolicy {
     Any,
 }
 
-impl CrossDomainPolicy {
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for CrossDomainPolicy {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "subdomainsonly" | "subdomains_only" => CrossDomainPolicy::SubdomainsOnly,
-            "any" => CrossDomainPolicy::Any,
-            _ => CrossDomainPolicy::None,
+            "subdomainsonly" | "subdomains_only" => Ok(CrossDomainPolicy::SubdomainsOnly),
+            "any" => Ok(CrossDomainPolicy::Any),
+            _ => Ok(CrossDomainPolicy::None),
         }
     }
-}
-
-#[derive(ConfigSchema)]
-pub struct UrlProcessingConfig {
-    #[config_schema(secret)]
-    pub boost_words: Secret<Vec<String>>,
-    #[config_schema(secret)]
-    pub max_url_length: Secret<u32>,
-    #[config_schema(secret)]
-    pub cross_domain_policy: Secret<String>,
-    #[config_schema(secret)]
-    pub normalize_prefixes: Secret<Vec<String>>,
-    #[config_schema(secret)]
-    pub cache_ttl_seconds: Secret<Option<u64>>,
 }
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
@@ -187,10 +175,10 @@ impl DomainState {
         };
 
         for bucket in queue_order {
-            if let Some(q) = self.queues.get_mut(&bucket) {
-                if !q.is_empty() {
-                    return q.pop();
-                }
+            if let Some(q) = self.queues.get_mut(&bucket)
+                && !q.is_empty()
+            {
+                return q.pop();
             }
         }
 
@@ -288,10 +276,8 @@ pub struct DomainCrawlerAgentImpl {
 #[agent_implementation]
 impl DomainCrawlerAgent for DomainCrawlerAgentImpl {
     fn new(domain_name: String, #[agent_config] config: Config<DomainCrawlerConfig>) -> Self {
-        let prefixes = config.get().url_processing.normalize_prefixes.get();
-        let normalized = crate::common::normalize_domain(&domain_name, &prefixes);
         Self {
-            state: DomainState::new(normalized),
+            state: DomainState::new(domain_name),
             config,
         }
     }
@@ -406,14 +392,13 @@ fn is_subdomain(sub: &str, parent: &str) -> bool {
 impl DomainCrawlerAgentImpl {
     async fn process_extracted_links(&mut self, extracted_links: Vec<url::Url>) {
         let config = self.config.get();
+        let db_cfg = config.db;
         let max_url_len = config.url_processing.max_url_length.get();
         let boost_words = config.url_processing.boost_words.get();
-        let db_cfg = config.db;
-        let normalize_prefixes = config.url_processing.normalize_prefixes.get();
 
         let current_policy = self.state.cross_domain_policy.clone().unwrap_or_else(|| {
             let config_policy_str = config.url_processing.cross_domain_policy.get();
-            CrossDomainPolicy::from_str(&config_policy_str)
+            config_policy_str.parse().unwrap_or(CrossDomainPolicy::None)
         });
 
         // 1. Filter out URLs exceeding max length or domain constraints first
@@ -425,11 +410,7 @@ impl DomainCrawlerAgentImpl {
             }
             if let Some(domain) = link_url.host_str() {
                 let is_allowed = match current_policy {
-                    CrossDomainPolicy::None => {
-                        let normalized_domain =
-                            crate::common::normalize_domain(domain, &normalize_prefixes);
-                        normalized_domain == self.state.domain
-                    }
+                    CrossDomainPolicy::None => domain == self.state.domain,
                     CrossDomainPolicy::SubdomainsOnly => is_subdomain(domain, &self.state.domain),
                     CrossDomainPolicy::Any => true,
                 };
@@ -449,16 +430,13 @@ impl DomainCrawlerAgentImpl {
             }
         };
 
-        // 3. Group and prioritize URLs by normalized domain
-        let grouped_by_domain = crate::common::group_prioritized_urls_by_normalized_domain(
-            uncrawled_urls,
-            &normalize_prefixes,
-            |u| {
+        // 3. Group and prioritize URLs by domain
+        let grouped_by_domain =
+            crate::common::group_prioritized_urls_by_domain(uncrawled_urls, |u| {
                 let link_str = u.to_string();
                 let priority = calculate_priority(&link_str, &boost_words);
                 PrioritizedUrl { url: u, priority }
-            },
-        );
+            });
 
         for (domain, prioritized_urls) in grouped_by_domain {
             if domain == self.state.domain {
@@ -584,10 +562,10 @@ fn parse_robots_txt(content: &str) -> (Vec<String>, Option<u32>) {
                 if !val.is_empty() {
                     disallowed.push(val.to_string());
                 }
-            } else if key == "crawl-delay" {
-                if let Ok(secs) = val.parse::<f64>() {
-                    crawl_delay = Some((secs * 1000.0) as u32);
-                }
+            } else if key == "crawl-delay"
+                && let Ok(secs) = val.parse::<f64>()
+            {
+                crawl_delay = Some((secs * 1000.0) as u32);
             }
         }
     }

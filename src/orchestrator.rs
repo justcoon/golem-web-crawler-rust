@@ -1,4 +1,4 @@
-use crate::common::PrioritizedUrl;
+use crate::common::{FilterType, LinkFilter, PrioritizedUrl, UrlProcessingConfig};
 use crate::common_lib::database::{DatabaseHelper, PostgresDbConfig};
 use crate::domain_crawler::DomainCrawlerAgentClient;
 use crate::encode_params;
@@ -7,8 +7,6 @@ use golem_rust::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::domain_crawler::UrlProcessingConfig;
-
 #[derive(ConfigSchema)]
 pub struct OrchestratorConfig {
     #[config_schema(nested)]
@@ -16,8 +14,6 @@ pub struct OrchestratorConfig {
     #[config_schema(nested)]
     pub url_processing: UrlProcessingConfig,
 }
-
-use crate::common::{FilterType, LinkFilter};
 
 #[derive(Clone, Debug, Schema, Serialize, Deserialize)]
 pub struct DomainInfo {
@@ -72,23 +68,22 @@ impl OrchestratorAgent for OrchestratorAgentImpl {
         } else {
             let normalize_prefixes = self.config.get().url_processing.normalize_prefixes.get();
 
-            // Parse seed URLs
+            // Parse and normalize seed URLs
             let mut parsed_urls = Vec::new();
             for url in seeds {
                 let parsed_url = url::Url::parse(&url)
                     .map_err(|_| OrchestratorError::InvalidUrl { url: url.clone() })?;
-                parsed_urls.push(parsed_url);
+                let normalized_url =
+                    crate::common::normalize_url_domain(&parsed_url, &normalize_prefixes);
+                parsed_urls.push(normalized_url);
             }
 
-            // Group and prioritize seed URLs by normalized domain
-            let grouped_by_domain = crate::common::group_prioritized_urls_by_normalized_domain(
-                parsed_urls,
-                &normalize_prefixes,
-                |u| PrioritizedUrl {
+            // Group and prioritize seed URLs by domain
+            let grouped_by_domain =
+                crate::common::group_prioritized_urls_by_domain(parsed_urls, |u| PrioritizedUrl {
                     url: u,
                     priority: 10, // Default seed priority
-                },
-            );
+                });
 
             // Forward to respective DomainCrawlerAgents asynchronously
             for (domain, prioritized_urls) in grouped_by_domain {
