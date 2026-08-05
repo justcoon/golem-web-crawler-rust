@@ -16,8 +16,18 @@ CREATE TABLE page_contents (
 CREATE INDEX idx_page_contents_domain ON page_contents(domain);
 
 -- Index to optimize Full-Text Search (FTS) on title and extracted text
-CREATE INDEX idx_page_contents_fts ON page_contents 
+CREATE INDEX idx_page_contents_fts ON page_contents
 USING gin(to_tsvector('english', coalesce(title, '') || ' ' || coalesce(extracted_text, '')));
+
+-- Create the url_redirects table to map requested URLs to their final redirect destinations
+CREATE TABLE url_redirects (
+    from_url TEXT PRIMARY KEY,
+    to_url TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index to optimize redirect target lookups
+CREATE INDEX idx_url_redirects_to_url ON url_redirects(to_url);
 
 -- Create the link_filters table to exclude ads, spam, and social networks
 CREATE TABLE link_filters (

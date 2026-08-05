@@ -491,7 +491,9 @@ async fn filter_uncrawled_urls(
             .transactional(|tx| {
                 match cache_ttl_seconds {
                     Some(ttl) => {
-                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1) AND saved_at > CURRENT_TIMESTAMP - ($2 || ' second')::INTERVAL";
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1) AND saved_at > CURRENT_TIMESTAMP - ($2 || ' second')::INTERVAL \
+                                   UNION \
+                                   SELECT from_url AS url FROM url_redirects WHERE from_url = ANY($1) AND created_at > CURRENT_TIMESTAMP - ($2 || ' second')::INTERVAL";
                         let ttl_i64 = ttl as i64;
                         let res = tx.query(sql, crate::encode_params!(&url_strs, &ttl_i64))?;
                         use crate::common_lib::database::decode::DbResultDecoder;
@@ -499,7 +501,9 @@ async fn filter_uncrawled_urls(
                         Ok(rows.into_iter().map(|s| s.0).collect())
                     }
                     None => {
-                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1)";
+                        let sql = "SELECT url FROM page_contents WHERE url = ANY($1) \
+                                   UNION \
+                                   SELECT from_url AS url FROM url_redirects WHERE from_url = ANY($1)";
                         let res = tx.query(sql, crate::encode_params!(&url_strs))?;
                         use crate::common_lib::database::decode::DbResultDecoder;
                         let rows = Single::<String>::decode_result(res)?;

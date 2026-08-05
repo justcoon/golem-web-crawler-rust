@@ -113,11 +113,12 @@ impl FetcherAgent for FetcherAgentImpl {
                 tx.execute(sql, encode_params!(&final_url_str, &domain, &title, &(status as i32), &body, &extracted_text))?;
 
                 if final_url_str != url_str {
-                    let original_domain = url.host_str().unwrap_or_default().to_string();
-                    let sql_redirect = "INSERT INTO page_contents (url, domain, title, http_status) \
-                                       VALUES ($1, $2, $3, $4) \
-                                       ON CONFLICT (url) DO NOTHING";
-                    tx.execute(sql_redirect, encode_params!(&url_str, &original_domain, &"Redirect".to_string(), &(status as i32)))?;
+                    let sql_redirect = "INSERT INTO url_redirects (from_url, to_url) \
+                                       VALUES ($1, $2) \
+                                       ON CONFLICT (from_url) DO UPDATE SET \
+                                       to_url = EXCLUDED.to_url, \
+                                       created_at = CURRENT_TIMESTAMP";
+                    tx.execute(sql_redirect, encode_params!(&url_str, &final_url_str))?;
                 }
                 Ok(())
             })
