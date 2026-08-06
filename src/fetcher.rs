@@ -88,7 +88,7 @@ impl FetcherAgent for FetcherAgentImpl {
             })?;
 
         // Extract title and links using helper (resolved relative to final redirected URL)
-        let (title, extracted_links) = extract_content(&final_url, &body, &active_filters);
+        let (title, extracted_text, extracted_links) = extract_content(&final_url, &body, &active_filters);
 
         // Normalize domain of extracted URLs as a separate step after extraction
         let extracted_links = extracted_links
@@ -110,14 +110,15 @@ impl FetcherAgent for FetcherAgentImpl {
                            raw_html = EXCLUDED.raw_html, \
                            extracted_text = EXCLUDED.extracted_text, \
                            saved_at = CURRENT_TIMESTAMP";
-                tx.execute(sql, encode_params!(&final_url_str, &domain, &title, &(status as i32), &body, &body))?;
+                tx.execute(sql, encode_params!(&final_url_str, &domain, &title, &(status as i32), &body, &extracted_text))?;
 
                 if final_url_str != url_str {
-                    let original_domain = url.host_str().unwrap_or_default().to_string();
-                    let sql_redirect = "INSERT INTO page_contents (url, domain, title, http_status) \
-                                       VALUES ($1, $2, $3, $4) \
-                                       ON CONFLICT (url) DO NOTHING";
-                    tx.execute(sql_redirect, encode_params!(&url_str, &original_domain, &"Redirect".to_string(), &(status as i32)))?;
+                    let sql_redirect = "INSERT INTO url_redirects (from_url, to_url) \
+                                       VALUES ($1, $2) \
+                                       ON CONFLICT (from_url) DO UPDATE SET \
+                                       to_url = EXCLUDED.to_url, \
+                                       created_at = CURRENT_TIMESTAMP";
+                    tx.execute(sql_redirect, encode_params!(&url_str, &final_url_str))?;
                 }
                 Ok(())
             })
@@ -254,11 +255,32 @@ fn is_filtered(url: &url::Url, filters: &[(String, crate::common::FilterType)]) 
     false
 }
 
+fn extract_text_from_html(html: &str) -> String {
+    let script_regex = Regex::new(r"(?is)<script.*?>.*?</script>").unwrap();
+    let style_regex = Regex::new(r"(?is)<style.*?>.*?</style>").unwrap();
+    let tag_regex = Regex::new(r"(?s)<.*?>").unwrap();
+
+    let text_no_script = script_regex.replace_all(html, " ");
+    let text_no_style = style_regex.replace_all(&text_no_script, " ");
+    let text_no_tags = tag_regex.replace_all(&text_no_style, " ");
+
+    let decoded = text_no_tags
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+
+    let whitespace_regex = Regex::new(r"\s+").unwrap();
+    whitespace_regex.replace_all(&decoded, " ").trim().to_string()
+}
+
 fn extract_content(
     base_url: &url::Url,
     body: &str,
     active_filters: &[(String, crate::common::FilterType)],
-) -> (String, Vec<url::Url>) {
+) -> (String, String, Vec<url::Url>) {
     // Extract title using regex (case-insensitive)
     let title_regex = Regex::new(r"(?i)<title>(?P<title>.*?)</title>").unwrap();
     let title = title_regex
@@ -266,6 +288,8 @@ fn extract_content(
         .and_then(|c| c.name("title"))
         .map(|m| m.as_str().trim().to_string())
         .unwrap_or_default();
+
+    let extracted_text = extract_text_from_html(body);
 
     // Check for a <base href="..."> tag in the HTML body to determine resolution context
     let base_tag_regex = Regex::new(r#"(?i)<base\s+[^>]*href\s*=\s*["']([^"']+)["']"#).unwrap();
@@ -308,13 +332,33 @@ fn extract_content(
             }
         }
     }
-    (title, extracted_links)
+    (title, extracted_text, extracted_links)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use url::Url;
+
+    #[test]
+    fn test_extract_text_from_html() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Sample Title</title>
+                <style>body { color: red; }</style>
+                <script>console.log("ignore me");</script>
+            </head>
+            <body>
+                <h1>Header &amp; Title</h1>
+                <p>This is a <b>test</b> paragraph with &nbsp; spaces.</p>
+            </body>
+            </html>
+        "#;
+        let text = extract_text_from_html(html);
+        assert_eq!(text, "Sample Title Header & Title This is a test paragraph with spaces.");
+    }
 
     #[test]
     fn test_extract_content_filters() {
@@ -353,8 +397,9 @@ mod tests {
             (".js".to_string(), crate::common::FilterType::Extension),
         ];
 
-        let (title, links) = extract_content(&base_url, body, &active_filters);
+        let (title, text, links) = extract_content(&base_url, body, &active_filters);
         assert_eq!(title, "Test Page");
+        assert!(text.contains("About Us Contact JS Link"));
 
         let expected_links: Vec<Url> = vec![
             Url::parse("https://example.com/about").unwrap(),
@@ -380,7 +425,7 @@ mod tests {
             </html>
         "##;
 
-        let (title, links) = extract_content(&base_url, body, &[]);
+        let (title, _text, links) = extract_content(&base_url, body, &[]);
         assert_eq!(title, "Base Tag Test");
         let expected_links: Vec<Url> = vec![
             Url::parse("https://example.com/archive/about").unwrap(),
@@ -390,3 +435,4 @@ mod tests {
         assert_eq!(links, expected_links);
     }
 }
+
